@@ -1,0 +1,6 @@
+[submodule "mcpserver"]
+	path = mcpserver
+	url = https://git.woa.com/brainfkli/mcpserver.git
+[submodule "renderdoc"]
+	path = renderdoc
+	url = https://github.com/baldurk/renderdoc.git
