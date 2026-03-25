@@ -1,93 +1,94 @@
 # renderdoc-mcp
 
-MCP server for [RenderDoc](https://renderdoc.org/) — let AI assistants analyze GPU frame captures (`.rdc` files) for graphics debugging and performance analysis.
+[RenderDoc](https://renderdoc.org/) 的 MCP 服务器 —— 让 AI 助手分析 GPU 帧捕获文件（`.rdc`），用于图形调试与性能分析。
 
-Built on the [Model Context Protocol](https://modelcontextprotocol.io/), works with Claude Desktop, Cursor, VS Code, and any MCP-compatible client.
+基于 [Model Context Protocol](https://modelcontextprotocol.io/) 构建，支持 Claude Desktop、Cursor、VS Code 及所有兼容 MCP 的客户端。
 
-## Features
+## 特性
 
-- **42 tools** covering the full RenderDoc analysis workflow
-- **10 high-level tools** for one-call analysis (draw call state, frame overview, diff, batch export, pixel region sampling, etc.)
-- **3 built-in prompts** for guided debugging
-- **Human-readable output** — blend modes, depth functions, topology shown as names not numbers
-- **GPU quirk detection** — auto-identifies Adreno/Mali/PowerVR/Apple-specific pitfalls from driver name
-- **Headless** — no GUI needed, runs entirely via RenderDoc's Python replay API
-- Supports D3D11, D3D12, OpenGL, Vulkan, OpenGL ES captures
+- **完全独立运行** —— 自带从源码编译的 `renderdoc.pyd`，**不依赖也不干扰**系统中已安装的 RenderDoc。你可以同时使用系统的 RenderDoc GUI 进行日常调试，两者互不影响
+- **42 个工具**，覆盖完整的 RenderDoc 分析流程
+- **10 个高级工具**，一次调用即可完成分析（Draw Call 状态、帧概览、对比、批量导出、像素区域采样等）
+- **3 个内置提示模板**，引导 AI 进行调试
+- **人类可读输出** —— 混合模式、深度函数、拓扑类型均以名称而非数字显示
+- **GPU 特性检测** —— 根据驱动名称自动识别 Adreno/Mali/PowerVR/Apple 特有的问题
+- **无头运行** —— 无需 GUI，完全通过 RenderDoc 的 Python Replay API 运行
+- 支持 D3D11、D3D12、OpenGL、Vulkan、OpenGL ES 捕获文件
 
-## How It Works
+## 工作原理
 
 ```
-AI Assistant ←—MCP—→ renderdoc-mcp server ←—Python API—→ renderdoc.pyd ←→ GPU replay
+AI 助手 <--MCP--> renderdoc-mcp server <--Python API--> renderdoc.pyd <--> GPU replay
 ```
 
-The server uses RenderDoc's headless replay API (`renderdoc.pyd`) to:
-1. Open `.rdc` capture files without the GUI
-2. Replay frames and query pipeline state at any event
-3. Extract textures, buffers, shader data, and pixel history
-4. Return structured JSON for the AI to reason about
+服务器使用 RenderDoc 的无头回放 API（`renderdoc.pyd`）来：
+1. 无需 GUI 即可打开 `.rdc` 捕获文件
+2. 回放帧并查询任意事件处的管线状态
+3. 提取纹理、缓冲区、Shader 数据和像素历史
+4. 返回结构化 JSON 供 AI 进行推理分析
 
-## Build from Source
+## 从源码构建
 
-This repository includes RenderDoc source as a Git submodule and provides automated build scripts to compile `renderdoc.pyd` and install the MCP server in one step.
+本仓库以 Git 子模块的形式包含了 RenderDoc 源码，并提供自动化构建脚本，一步完成 `renderdoc.pyd` 的编译和 MCP 服务器的安装。
 
-### Prerequisites
+### 前置条件
 
-- **Python ≥ 3.6** — full installation with development headers and libs
-  - Download from [python.org](https://www.python.org/downloads/)
-  - Make sure to check **"Add Python to PATH"** during installation
-- **Visual Studio 2015 or later** — with **C++ build tools** (Desktop development with C++)
-  - Download from [visualstudio.microsoft.com](https://visualstudio.microsoft.com/downloads/)
+- **Python >= 3.6** —— 完整安装，需包含开发头文件和库文件
+  - 从 [python.org](https://www.python.org/downloads/) 下载
+  - 安装时务必勾选 **"Add Python to PATH"**
+- **Visual Studio 2015 或更高版本** —— 需安装 **C++ 生成工具**（使用 C++ 的桌面开发）
+  - 从 [visualstudio.microsoft.com](https://visualstudio.microsoft.com/downloads/) 下载
 
-### Build & Install
+### 构建与安装
 
-#### Option A: Double-click (simplest)
+#### 方式 A：双击运行（最简单）
 
-Double-click `build_and_install.bat` — it runs the PowerShell script with the correct execution policy.
+双击 `build_and_install.bat` —— 它会以正确的执行策略运行 PowerShell 脚本。
 
-#### Option B: PowerShell
+#### 方式 B：PowerShell
 
 ```powershell
-# If execution policy blocks the script:
+# 如果执行策略阻止了脚本运行：
 powershell -ExecutionPolicy Bypass -File .\build_and_install.ps1
 
-# Or with a clean build:
+# 执行干净构建：
 powershell -ExecutionPolicy Bypass -File .\build_and_install.ps1 -Clean
 ```
 
-#### Script Parameters
+#### 脚本参数
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `-Configuration` | `Release` | Build configuration (`Release` / `Debug`) |
-| `-Platform` | `x64` | Target platform |
-| `-Clean` | off | Clean build — runs MSBuild Clean and removes intermediates first |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-Configuration` | `Release` | 构建配置（`Release` / `Debug`） |
+| `-Platform` | `x64` | 目标平台 |
+| `-Clean` | 关闭 | 干净构建 —— 先执行 MSBuild Clean 并删除中间文件 |
 
-#### What the script does
+#### 脚本执行步骤
 
-1. **Detect** Python and Visual Studio / MSBuild environment
-2. **Patch** `python.props` to work with standard Python installations (removes `.zip` file checks)
-3. **Build** `renderdoc.pyd` and `renderdoc.dll` via MSBuild
-4. **Collect** build outputs to `build/x64/`
-5. **Install** MCP server via `pip install -e`
-6. **Generate** `mcp.json` configuration file
+1. **检测** Python 和 Visual Studio / MSBuild 环境
+2. **修补** `python.props`，适配标准 Python 安装（移除 `.zip` 文件检查）
+3. **编译** `renderdoc.pyd` 和 `renderdoc.dll`（通过 MSBuild）
+4. **收集** 构建产物到 `build/x64/`
+5. **安装** MCP 服务器（通过 `pip install -e`）
+6. **生成** `mcp.json` 配置文件
 
-After a successful build, you'll find the outputs in:
+构建成功后，产物位于：
 
 ```
 build/x64/
-├── renderdoc.pyd          # Python module
-├── renderdoc.dll          # Core library
+├── renderdoc.pyd          # Python 模块
+├── renderdoc.dll          # 核心库
 └── ...
 ```
 
-## Configure Your MCP Client
+## 配置 MCP 客户端
 
-The build script generates a `mcp.json` file. Copy its contents to your MCP client configuration:
+构建脚本会生成 `mcp.json` 文件，将其内容复制到你的 MCP 客户端配置中：
 
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Edit `claude_desktop_config.json` (Settings → Developer → Edit Config):
+编辑 `claude_desktop_config.json`（Settings -> Developer -> Edit Config）：
 
 ```json
 {
@@ -108,7 +109,7 @@ Edit `claude_desktop_config.json` (Settings → Developer → Edit Config):
 <details>
 <summary><b>Cursor</b></summary>
 
-Add to `~/.cursor/mcp.json`:
+添加到 `~/.cursor/mcp.json`：
 
 ```json
 {
@@ -129,7 +130,7 @@ Add to `~/.cursor/mcp.json`:
 <details>
 <summary><b>VS Code</b></summary>
 
-Add to `.vscode/mcp.json`:
+添加到 `.vscode/mcp.json`：
 
 ```json
 {
@@ -147,164 +148,164 @@ Add to `.vscode/mcp.json`:
 
 </details>
 
-> **Note:** Replace the paths with your actual Python executable and build output directory. The generated `mcp.json` already contains the correct paths for your system.
+> **提示：** 请将路径替换为你实际的 Python 可执行文件路径和构建输出目录。脚本生成的 `mcp.json` 已包含适合你系统的正确路径。
 
-## Usage Examples
+## 使用示例
 
-Once configured, just talk to your AI assistant:
+配置完成后，直接与 AI 助手对话即可：
 
-> "Open `frame.rdc` and show me what's happening in the frame"
+> "打开 `frame.rdc`，告诉我这一帧里发生了什么"
 
-> "Find the draw call that renders the character model and check its pipeline state"
+> "找到渲染角色模型的 Draw Call，检查它的管线状态"
 
-> "Why is my shadow map rendering black? Check the depth pass"
+> "我的阴影贴图为什么是全黑的？检查一下 Depth Pass"
 
-> "Analyze performance — are there any redundant draw calls?"
+> "分析性能 —— 有没有冗余的 Draw Call？"
 
-### Typical Tool Flow
-
-```
-open_capture("frame.rdc")                     # Load the capture
-├── get_capture_info()                         # API, GPU, known_gpu_quirks
-├── get_frame_overview()                       # Frame-level stats and render passes
-├── get_draw_call_state(142)                   # Complete draw call state in one call
-├── diff_draw_calls(140, 142)                  # Compare two draw calls
-├── export_draw_textures(142, "./tex/")        # Batch export all bound textures
-├── save_render_target(142, "./rt.png")        # Save render target snapshot
-├── analyze_render_passes()                    # Auto-detect render pass boundaries
-├── sample_pixel_region(rt_id, 0,0,512,512)   # Scan RT region for NaN/Inf/negatives
-├── pixel_history(id, 512, 384)               # Debug a specific pixel
-├── export_mesh(142, "./mesh.obj")             # Export mesh as OBJ
-└── close_capture()                            # Clean up
-```
-
-For performance and diagnostics:
+### 典型工具调用流程
 
 ```
-get_pass_timing(granularity="pass")      # Find most expensive render passes
-analyze_overdraw()                        # Fill-rate pressure estimate
-analyze_bandwidth()                       # Memory bandwidth estimate
-analyze_state_changes()                   # Batching opportunities
-diagnose_negative_values()               # Find NaN/Inf/negative color values
-diagnose_precision_issues()              # R11G11B10, D16, SRGB mismatches
-diagnose_reflection_mismatch()           # Reflection artifact diagnosis
-diagnose_mobile_risks()                  # Comprehensive mobile GPU risk check
+open_capture("frame.rdc")                     # 加载捕获文件
+├── get_capture_info()                         # API、GPU、已知 GPU 问题
+├── get_frame_overview()                       # 帧级统计与渲染 Pass
+├── get_draw_call_state(142)                   # 一次调用获取完整 Draw Call 状态
+├── diff_draw_calls(140, 142)                  # 对比两个 Draw Call
+├── export_draw_textures(142, "./tex/")        # 批量导出所有绑定纹理
+├── save_render_target(142, "./rt.png")        # 保存渲染目标快照
+├── analyze_render_passes()                    # 自动检测渲染 Pass 边界
+├── sample_pixel_region(rt_id, 0,0,512,512)   # 扫描 RT 区域，检测 NaN/Inf/负值
+├── pixel_history(id, 512, 384)               # 调试特定像素
+├── export_mesh(142, "./mesh.obj")             # 导出网格为 OBJ
+└── close_capture()                            # 释放资源
 ```
 
-## Tools Reference
+性能与诊断分析：
 
-### Session Management (4)
+```
+get_pass_timing(granularity="pass")      # 找出最耗时的渲染 Pass
+analyze_overdraw()                        # Overdraw 估算
+analyze_bandwidth()                       # 显存带宽估算
+analyze_state_changes()                   # 合批优化机会
+diagnose_negative_values()               # 查找 NaN/Inf/负值（爆闪）
+diagnose_precision_issues()              # R11G11B10、D16、SRGB 精度问题
+diagnose_reflection_mismatch()           # 反射伪影诊断
+diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
+```
 
-| Tool | Description |
-|------|-------------|
-| `open_capture` | Open a `.rdc` file (auto-closes previous) |
-| `close_capture` | Close current capture and free resources |
-| `get_capture_info` | Capture metadata: API, action count, resolution, **known_gpu_quirks** |
-| `get_frame_overview` | Frame-level statistics: action counts by type, texture/buffer memory, render targets |
+## 工具列表
 
-### Event Navigation (5)
+### 会话管理（4 个）
 
-| Tool | Description |
-|------|-------------|
-| `list_actions` | List draw call / action tree with `filter` and `event_type` support |
-| `get_action` | Full detail for a single action |
-| `set_event` | Navigate to an event (required before pipeline queries) |
-| `search_actions` | Search by name pattern and/or action flags |
-| `find_draws` | Search draw calls by rendering state: blend, min vertices, texture/shader/RT binding |
+| 工具 | 说明 |
+|------|------|
+| `open_capture` | 打开 `.rdc` 文件（自动关闭之前的捕获） |
+| `close_capture` | 关闭当前捕获并释放资源 |
+| `get_capture_info` | 捕获元数据：API、Action 数量、分辨率、**已知 GPU 问题** |
+| `get_frame_overview` | 帧级统计：按类型的 Action 数量、纹理/缓冲区显存、渲染目标 |
 
-### Pipeline Inspection (4)
+### 事件导航（5 个）
 
-| Tool | Description |
-|------|-------------|
-| `get_pipeline_state` | Full state: topology, viewports, rasterizer, blend, depth, stencil |
-| `get_shader_bindings` | Constant buffers, SRVs, UAVs, samplers for a shader stage |
-| `get_vertex_inputs` | Vertex attributes, vertex/index buffer bindings |
-| `get_draw_call_state` | **One-call draw analysis**: action + blend + depth + stencil + rasterizer + textures + RTs + shaders |
+| 工具 | 说明 |
+|------|------|
+| `list_actions` | 列出 Draw Call / Action 树，支持 `filter` 和 `event_type` 筛选 |
+| `get_action` | 获取单个 Action 的完整信息 |
+| `set_event` | 导航到指定事件（管线查询前必须调用） |
+| `search_actions` | 按名称模式和/或 Action 标志搜索 |
+| `find_draws` | 按渲染状态搜索 Draw Call：混合、最小顶点数、纹理/Shader/RT 绑定 |
 
-### Resource Analysis (4)
+### 管线检查（4 个）
 
-| Tool | Description |
-|------|-------------|
-| `list_textures` | All textures (filterable by format, min width) |
-| `list_buffers` | All buffers (filterable by min size) |
-| `list_resources` | All named resources (filterable by type, name pattern) |
-| `get_resource_usage` | Which events read/write a resource |
+| 工具 | 说明 |
+|------|------|
+| `get_pipeline_state` | 完整状态：拓扑、视口、光栅化、混合、深度、模板 |
+| `get_shader_bindings` | 指定 Shader 阶段的 CBV、SRV、UAV、采样器 |
+| `get_vertex_inputs` | 顶点属性、顶点/索引缓冲区绑定 |
+| `get_draw_call_state` | **一次调用完整分析**：Action 信息 + 混合公式 + 深度 + 模板 + 光栅化 + 纹理尺寸 + RT + Shader |
 
-### Data Extraction (8)
+### 资源分析（4 个）
 
-| Tool | Description |
-|------|-------------|
-| `save_texture` | Export to PNG, JPG, BMP, TGA, HDR, EXR, or DDS |
-| `get_buffer_data` | Read buffer bytes (hex dump or float32 array) |
-| `pick_pixel` | RGBA value at a coordinate |
-| `get_texture_stats` | Per-channel min/max/avg with anomaly detection (NaN/Inf/negative) |
-| `read_texture_pixels` | Read a rectangular region of pixels (up to 64×64) |
-| `export_draw_textures` | Batch export all textures bound to a draw call |
-| `save_render_target` | Save RT snapshot at an event (color + optional depth) |
-| `export_mesh` | Export mesh as OBJ with positions, normals, UVs |
+| 工具 | 说明 |
+|------|------|
+| `list_textures` | 所有纹理（可按格式、最小宽度筛选） |
+| `list_buffers` | 所有缓冲区（可按最小大小筛选） |
+| `list_resources` | 所有命名资源（可按类型、名称模式筛选） |
+| `get_resource_usage` | 查询哪些事件读写了指定资源 |
 
-### Shader Analysis (3)
+### 数据提取（8 个）
 
-| Tool | Description |
-|------|-------------|
-| `disassemble_shader` | Shader disassembly with auto fallback chain, `search` and `line_range` support |
-| `get_shader_reflection` | Input/output signatures, resource binding layout |
-| `get_cbuffer_contents` | Actual constant buffer variable values with `filter` support |
+| 工具 | 说明 |
+|------|------|
+| `save_texture` | 导出为 PNG、JPG、BMP、TGA、HDR、EXR 或 DDS |
+| `get_buffer_data` | 读取缓冲区数据（十六进制或 float32 数组） |
+| `pick_pixel` | 获取指定坐标的 RGBA 值 |
+| `get_texture_stats` | 每通道最小/最大/平均值，带异常检测（NaN/Inf/负值） |
+| `read_texture_pixels` | 读取矩形像素区域（最大 64x64） |
+| `export_draw_textures` | 批量导出 Draw Call 绑定的所有纹理 |
+| `save_render_target` | 保存指定事件处的 RT 快照（颜色 + 可选深度） |
+| `export_mesh` | 导出网格为 OBJ（包含位置、法线、UV） |
 
-### Advanced (6)
+### Shader 分析（3 个）
 
-| Tool | Description |
-|------|-------------|
-| `pixel_history` | Full per-pixel modification history across all events |
-| `get_post_vs_data` | Post-transform vertex data (VS out / GS out) |
-| `diff_draw_calls` | Compare two draw calls with human-readable implications |
-| `analyze_render_passes` | Auto-detect render pass boundaries |
-| `sample_pixel_region` | Uniform-grid scan of RT region — detects NaN/Inf/negative/overexposed |
-| `debug_shader_at_pixel` | Per-pixel shader debug with variable trace |
+| 工具 | 说明 |
+|------|------|
+| `disassemble_shader` | Shader 反汇编，支持自动回退链、`search` 关键字搜索和 `line_range` |
+| `get_shader_reflection` | 输入/输出签名、资源绑定布局 |
+| `get_cbuffer_contents` | 常量缓冲区变量的实际值，支持 `filter` 按名称筛选 |
 
-### Performance Analysis (4)
+### 高级功能（6 个）
 
-| Tool | Description |
-|------|-------------|
-| `get_pass_timing` | Most expensive render passes (GPU counters or heuristic fallback) |
-| `analyze_overdraw` | Overdraw estimate per render target group |
-| `analyze_bandwidth` | Write/read bandwidth estimate per render target |
-| `analyze_state_changes` | Finds redundant state-change patterns and batching opportunities |
+| 工具 | 说明 |
+|------|------|
+| `pixel_history` | 完整的逐像素修改历史（跨所有事件） |
+| `get_post_vs_data` | 变换后顶点数据（VS 输出 / GS 输出） |
+| `diff_draw_calls` | 对比两个 Draw Call，显示差异及其含义 |
+| `analyze_render_passes` | 自动检测渲染 Pass 边界 |
+| `sample_pixel_region` | 均匀网格采样 RT 区域 —— 检测 NaN/Inf/负值/过曝 |
+| `debug_shader_at_pixel` | 逐像素 Shader 调试，返回变量追踪信息 |
 
-### Diagnostics (4)
+### 性能分析（4 个）
 
-| Tool | Description |
-|------|-------------|
-| `diagnose_negative_values` | Scans float RTs for negative/NaN/Inf — finds first introducing event |
-| `diagnose_precision_issues` | R11G11B10 sign-bit loss, shallow depth buffers, SRGB/linear mismatches |
-| `diagnose_reflection_mismatch` | Compares reflection passes against main scene draws |
-| `diagnose_mobile_risks` | Comprehensive mobile GPU risk check (precision / performance / compatibility) |
+| 工具 | 说明 |
+|------|------|
+| `get_pass_timing` | 最耗时的渲染 Pass（优先使用 GPU 计数器，回退为三角形数量估算） |
+| `analyze_overdraw` | 每个 RT 分组的 Overdraw 估算 |
+| `analyze_bandwidth` | 每个 RT 的读写带宽估算 |
+| `analyze_state_changes` | 查找冗余状态切换和合批优化机会 |
 
-## Prompts
+### 诊断工具（4 个）
 
-Built-in prompt templates to guide AI through common workflows:
+| 工具 | 说明 |
+|------|------|
+| `diagnose_negative_values` | 扫描所有浮点 RT 中的负值/NaN/Inf —— 定位首次产生的事件，检测 TAA 累积 |
+| `diagnose_precision_issues` | 检查 R11G11B10 符号位丢失、浅深度缓冲区、SRGB/线性不匹配 |
+| `diagnose_reflection_mismatch` | 对比反射 Pass 与主场景 Draw —— 查找 Shader/混合/格式差异 |
+| `diagnose_mobile_risks` | 全面检查移动端风险（精度/性能/兼容性/GPU 特定问题） |
 
-| Prompt | Description |
-|--------|-------------|
-| `debug_draw_call` | Deep-dive a single draw call: pipeline → shaders → cbuffers → outputs |
-| `find_rendering_issue` | Systematic diagnosis from a problem description |
-| `analyze_performance` | Frame-wide perf analysis: pass timing, overdraw, bandwidth, state changes |
+## 提示模板
 
-## Project Structure
+内置的提示模板，引导 AI 完成常见调试流程：
+
+| 提示 | 说明 |
+|------|------|
+| `debug_draw_call` | 深入分析单个 Draw Call：管线 -> Shader -> CBV -> 输出 |
+| `find_rendering_issue` | 根据问题描述进行系统性诊断 |
+| `analyze_performance` | 全帧性能分析：Pass 耗时、Overdraw、带宽、状态切换 |
+
+## 项目结构
 
 ```
 renderdoc-mcp/
-├── renderdoc/                  # RenderDoc source (Git submodule)
-├── mcpserver/                  # MCP server Python package
+├── renderdoc/                  # RenderDoc 源码（Git 子模块）
+├── mcpserver/                  # MCP 服务器 Python 包
 │   ├── src/renderdoc_mcp/
-│   │   ├── server.py           # FastMCP server, prompt definitions
-│   │   ├── session.py          # Capture lifecycle, resource caches
-│   │   ├── util.py             # Serialization, enum maps, module loader
-│   │   └── tools/              # 9 tool modules (42 tools total)
+│   │   ├── server.py           # FastMCP 服务器，提示模板定义
+│   │   ├── session.py          # 捕获生命周期，资源缓存
+│   │   ├── util.py             # 序列化，枚举映射，模块加载器
+│   │   └── tools/              # 9 个工具模块（共 42 个工具）
 │   ├── tests/
 │   └── pyproject.toml
-├── build/                      # Build outputs (renderdoc.pyd, .dll)
-├── build_and_install.ps1       # Automated build script (PowerShell)
-├── build_and_install.bat       # Wrapper — double-click to build
-└── mcp.json                    # Generated MCP client configuration
+├── build/                      # 构建产物（renderdoc.pyd, .dll）
+├── build_and_install.ps1       # 自动化构建脚本（PowerShell）
+├── build_and_install.bat       # 包装脚本 —— 双击即可构建
+└── mcp.json                    # 生成的 MCP 客户端配置
 ```
