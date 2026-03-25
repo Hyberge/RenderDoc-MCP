@@ -6,10 +6,11 @@
     This script automates the following steps:
     1. Detect Python and Visual Studio environment
     2. Patch python.props to work with standard Python installations
-    3. Build renderdoc.pyd using MSBuild
-    4. Collect build outputs (renderdoc.pyd, renderdoc.dll)
-    5. Install MCP Server via pip
-    6. Generate MCP configuration file
+    3. Optionally run MSBuild solution Clean and remove residual intermediates
+    4. Build renderdoc.pyd using MSBuild
+    5. Collect build outputs (renderdoc.pyd, renderdoc.dll)
+    6. Install MCP Server via pip
+    7. Generate MCP configuration file
 
 .PREREQUISITES
     - Python >= 3.6 (full installation with include headers and libs)
@@ -18,16 +19,45 @@
 
 param(
     [string]$Configuration = "Release",
-    [string]$Platform = "x64"
+    [string]$Platform = "x64",
+    [switch]$Clean
 )
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-# Fix console encoding for MSBuild Chinese output
-$OriginalOutputEncoding = [Console]::OutputEncoding
+# =============================================================================
+# Encoding: force entire pipeline to UTF-8 so MSBuild, pip, vswhere, etc.
+#           produce readable output on any Windows locale.
+#
+#   Layer 1 — Console Code Page (chcp 65001)
+#             Native processes (MSBuild, pip, vswhere) inherit this from the
+#             console host; it controls how raw bytes are decoded for display.
+#
+#   Layer 2 — [Console]::OutputEncoding
+#             PowerShell uses this to decode stdout/stderr bytes from external
+#             processes captured via 2>&1 or variable assignment.
+#
+#   Layer 3 — $OutputEncoding
+#             PowerShell uses this when piping strings TO external processes.
+#
+#   Layer 4 — Environment variable PYTHONUTF8=1
+#             Forces Python (pip, our own scripts) to use UTF-8 for stdin/stdout
+#             regardless of the system locale, avoiding mojibake from pip.
+#
+# All four must agree on UTF-8 for a clean end-to-end experience.
+# =============================================================================
+
+$OriginalOutputEncoding   = [Console]::OutputEncoding
+$OriginalConsoleInputEnc  = [Console]::InputEncoding
+
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+$OutputEncoding           = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8           = "1"
+
+# chcp 65001 sets the console code page for child processes.
+# Redirect to Out-Null to suppress its own one-line output.
 chcp 65001 | Out-Null
 
 # =============================================================================
@@ -59,6 +89,243 @@ function Test-Command {
     return $?
 }
 
+function Test-FileLocked {
+    param([string]$FilePath)
+    if (-not (Test-Path $FilePath)) { return $false }
+    try {
+        $stream = [System.IO.File]::Open($FilePath, 'Open', 'ReadWrite', 'None')
+        $stream.Close()
+        return $false
+    }
+    catch {
+        return $true
+    }
+}
+
+function Get-LockingProcesses {
+    param([string]$FilePath)
+    # Use handle64.exe / handle.exe from Sysinternals if available, otherwise
+    # fall back to a heuristic: find python processes whose command line contains
+    # "renderdoc_mcp" — these are almost certainly the MCP server.
+    $Processes = @()
+
+    # Heuristic: find MCP server python processes
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'python3.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+        $cmdLine = $_.CommandLine
+        if ($cmdLine -and ($cmdLine -match "renderdoc_mcp")) {
+            $proc = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+            if ($proc) { $Processes += $proc }
+        }
+    }
+
+    return $Processes
+}
+
+function Stop-McpServerIfBlocking {
+    <#
+    .SYNOPSIS
+        Check if output files are locked by MCP server processes and offer to kill them.
+    .DESCRIPTION
+        Scans the target files for locks. If found, identifies the MCP server python
+        processes and either auto-terminates or prompts the user.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo[]]$FilesToCopy,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDir
+    )
+
+    $LockedFiles = @()
+    foreach ($f in $FilesToCopy) {
+        $DestFile = Join-Path $DestinationDir $f.Name
+        if (Test-FileLocked $DestFile) {
+            $LockedFiles += $DestFile
+        }
+    }
+
+    if ($LockedFiles.Count -eq 0) { return $true }
+
+    Write-Host ""
+    Write-Host "  [WARNING] The following files are locked by another process:" -ForegroundColor Yellow
+    foreach ($lf in $LockedFiles) {
+        Write-Host "    - $lf" -ForegroundColor Yellow
+    }
+
+    $McpProcesses = Get-LockingProcesses
+    if ($McpProcesses.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Detected running MCP server process(es):" -ForegroundColor Yellow
+        foreach ($p in $McpProcesses) {
+            Write-Host "    PID $($p.Id): $($p.ProcessName) -- $($p.Path)" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "  [1] Terminate MCP server and continue (recommended)" -ForegroundColor Cyan
+        Write-Host "  [2] Skip file copy (keep old files, finish build)" -ForegroundColor Cyan
+        Write-Host "  [3] Abort build" -ForegroundColor Cyan
+        Write-Host ""
+
+        $Choice = Read-Host "  Choose an option (1/2/3, default=1)"
+        if (-not $Choice) { $Choice = "1" }
+
+        switch ($Choice) {
+            "1" {
+                Write-Host ""
+                foreach ($p in $McpProcesses) {
+                    Write-Host "  Stopping PID $($p.Id) ($($p.ProcessName))..." -NoNewline
+                    try {
+                        $p.Kill()
+                        $p.WaitForExit(5000) | Out-Null
+                        Write-Host " done" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host " failed: $_" -ForegroundColor Red
+                    }
+                }
+                # Brief pause to let OS release file handles
+                Start-Sleep -Milliseconds 500
+
+                # Verify files are now unlocked
+                $StillLocked = @()
+                foreach ($lf in $LockedFiles) {
+                    if (Test-FileLocked $lf) { $StillLocked += $lf }
+                }
+                if ($StillLocked.Count -gt 0) {
+                    Write-Host ""
+                    Write-Host "  [WARNING] Some files are still locked after termination:" -ForegroundColor Red
+                    foreach ($sl in $StillLocked) { Write-Host "    - $sl" -ForegroundColor Red }
+                    Write-Error-Exit `
+                        "Could not release file locks." `
+                        "Please manually close any program using files in: $DestinationDir"
+                }
+                Write-Success "MCP server stopped, file locks released"
+                return $true
+            }
+            "2" {
+                Write-Host ""
+                Write-Host "  Skipping file copy. The build outputs remain in:" -ForegroundColor Yellow
+                Write-Host "    $BuildProductDir" -ForegroundColor Yellow
+                Write-Host "  You can manually copy them after stopping the MCP server." -ForegroundColor Yellow
+                return $false
+            }
+            default {
+                Write-Error-Exit "Build aborted by user."
+            }
+        }
+    }
+    else {
+        # Files are locked but we can't identify the process
+        Write-Host ""
+        Write-Host "  Could not identify the locking process." -ForegroundColor Yellow
+        Write-Host "  Please close any MCP client (Claude Desktop, Cursor, VS Code, etc.)" -ForegroundColor Yellow
+        Write-Host "  that is using renderdoc-mcp, then re-run this script." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  [1] Retry copy" -ForegroundColor Cyan
+        Write-Host "  [2] Skip file copy (keep old files)" -ForegroundColor Cyan
+        Write-Host "  [3] Abort build" -ForegroundColor Cyan
+        Write-Host ""
+
+        $Choice = Read-Host "  Choose an option (1/2/3, default=1)"
+        if (-not $Choice) { $Choice = "1" }
+
+        switch ($Choice) {
+            "1" {
+                $StillLocked = @()
+                foreach ($lf in $LockedFiles) {
+                    if (Test-FileLocked $lf) { $StillLocked += $lf }
+                }
+                if ($StillLocked.Count -gt 0) {
+                    Write-Error-Exit `
+                        "Files are still locked." `
+                        "Close the process using files in: $DestinationDir"
+                }
+                return $true
+            }
+            "2" {
+                Write-Host ""
+                Write-Host "  Skipping file copy." -ForegroundColor Yellow
+                return $false
+            }
+            default {
+                Write-Error-Exit "Build aborted by user."
+            }
+        }
+    }
+
+    return $true
+}
+
+function Invoke-MSBuildSolutionClean {
+    param([Parameter(Mandatory = $true)][string]$SolutionPath)
+
+    if (-not (Test-Path $SolutionPath)) {
+        Write-Error-Exit "Solution file not found: $SolutionPath"
+    }
+
+    Write-Step "Cleaning solution with MSBuild..."
+
+    $FileLogger = "/flp:LogFile=$BuildLogFile;Verbosity=normal;Encoding=UTF-8;Append"
+    $CleanArgs = @(
+        $SolutionPath,
+        "/t:Clean",
+        "/p:Configuration=$Configuration",
+        "/p:Platform=$Platform",
+        "/p:PlatformToolset=$PlatformToolset",
+        "/m",
+        "/v:minimal",
+        "/utf-8",
+        $FileLogger
+    )
+
+    Write-Host "  Running: MSBuild renderdoc.sln /t:Clean"
+    $CleanResult = & $MsBuildPath @CleanArgs 2>&1
+    $CleanExitCode = $LASTEXITCODE
+
+    if ($CleanExitCode -ne 0) {
+        Write-Host "`n[Clean Output]" -ForegroundColor Yellow
+        Write-Host $CleanResult
+        Write-Error-Exit `
+            "Solution clean failed with exit code $CleanExitCode" `
+            "Check the build log at: $BuildLogFile"
+    }
+
+    Write-Success "MSBuild solution clean completed"
+}
+
+function Remove-BuildIntermediates {
+    param([Parameter(Mandatory = $true)][string]$BuildProductDir)
+
+    Write-Step "Removing residual build intermediates..."
+
+    if (-not (Test-Path $BuildProductDir)) {
+        Write-Host "  Build product directory does not exist yet: $BuildProductDir"
+        return
+    }
+
+    $RemovedItems = New-Object System.Collections.Generic.List[string]
+    $ObjDir = Join-Path $BuildProductDir "obj"
+
+    if (Test-Path $ObjDir) {
+        Remove-Item -Path $ObjDir -Recurse -Force
+        $RemovedItems.Add($ObjDir)
+    }
+
+    $IntermediatePatterns = @("*.ipdb", "*.iobj", "*.ipch", "*.ilk", "*.tmp")
+    foreach ($Pattern in $IntermediatePatterns) {
+        Get-ChildItem -Path $BuildProductDir -Filter $Pattern -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+            $RemovedItems.Add($_.FullName)
+        }
+    }
+
+    if ($RemovedItems.Count -eq 0) {
+        Write-Host "  No residual intermediate files found under: $BuildProductDir"
+    }
+    else {
+        Write-Success "Removed $($RemovedItems.Count) residual intermediate item(s) from: $BuildProductDir"
+    }
+}
+
 function Invoke-MSBuildProject {
     param(
         [Parameter(Mandatory = $true)][string]$ProjectPath,
@@ -78,6 +345,7 @@ function Invoke-MSBuildProject {
         "/p:SolutionDir=$($RenderDocSlnDir + '\')",
         "/m",
         "/v:minimal",
+        "/utf-8",
         $FileLogger
     )
 
@@ -296,6 +564,8 @@ if (-not (Test-Path $PyModuleVcxproj)) {
 
 $BuildOutputDir = Join-Path $ScriptDir "build\$Platform"
 $BuildLogFile = Join-Path $BuildOutputDir "build.log"
+$BuildProductDir = Join-Path $ScriptDir "renderdoc\$Platform\$Configuration"
+$PyModulesDir = Join-Path $BuildProductDir "pymodules"
 
 if (-not (Test-Path $BuildOutputDir)) {
     New-Item -ItemType Directory -Path $BuildOutputDir -Force | Out-Null
@@ -307,7 +577,13 @@ if (Test-Path $BuildLogFile) {
 
 Write-Host "  Configuration: $Configuration"
 Write-Host "  Platform: $Platform"
+Write-Host "  Clean build: $Clean"
 Write-Host "  Build log: $BuildLogFile"
+
+if ($Clean) {
+    Invoke-MSBuildSolutionClean -SolutionPath $RenderDocSln
+    Remove-BuildIntermediates -BuildProductDir $BuildProductDir
+}
 
 $env:RENDERDOC_PYTHON_PREFIX64 = $PythonPrefix
 
@@ -379,14 +655,22 @@ foreach ($f in $PydFiles) { Write-Host "    $($f.FullName)" }
 Write-Host "  Found .dll files:"
 foreach ($f in $UniqueDlls) { Write-Host "    $($f.FullName)" }
 
+# Check for file locks before copying (MCP server may hold renderdoc.pyd / .dll)
+$AllFilesToCopy = @()
+$AllFilesToCopy += $PydFiles
+$AllFilesToCopy += $UniqueDlls
+$ShouldCopy = Stop-McpServerIfBlocking -FilesToCopy $AllFilesToCopy -DestinationDir $BuildOutputDir
+
 # Copy all to output dir
-foreach ($f in $PydFiles) {
-    Copy-Item $f.FullName -Destination $BuildOutputDir -Force
-    Write-Success "Copied $($f.Name) to: $BuildOutputDir"
-}
-foreach ($f in $UniqueDlls) {
-    Copy-Item $f.FullName -Destination $BuildOutputDir -Force
-    Write-Success "Copied $($f.Name) to: $BuildOutputDir"
+if ($ShouldCopy) {
+    foreach ($f in $PydFiles) {
+        Copy-Item $f.FullName -Destination $BuildOutputDir -Force
+        Write-Success "Copied $($f.Name) to: $BuildOutputDir"
+    }
+    foreach ($f in $UniqueDlls) {
+        Copy-Item $f.FullName -Destination $BuildOutputDir -Force
+        Write-Success "Copied $($f.Name) to: $BuildOutputDir"
+    }
 }
 
 
@@ -503,3 +787,5 @@ Start-Process $McpConfigPath
 
 # Restore original console encoding
 [Console]::OutputEncoding = $OriginalOutputEncoding
+[Console]::InputEncoding  = $OriginalConsoleInputEnc
+Remove-Item Env:\PYTHONUTF8 -ErrorAction SilentlyContinue
