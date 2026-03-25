@@ -7,8 +7,9 @@
 ## 特性
 
 - **完全独立运行** —— 自带从源码编译的 `renderdoc.pyd`，**不依赖也不干扰**系统中已安装的 RenderDoc。你可以同时使用系统的 RenderDoc GUI 进行日常调试，两者互不影响
-- **42 个工具**，覆盖完整的 RenderDoc 分析流程
+- **51 个工具**，覆盖完整的 RenderDoc 分析流程，按"从总体到细节"五层设计，契合 AI 分析模式
 - **10 个高级工具**，一次调用即可完成分析（Draw Call 状态、帧概览、对比、批量导出、像素区域采样等）
+- **6 个检查工具**（新增），提供帧级诊断总览、API 属性查询、调试消息获取、描述符访问等
 - **3 个内置提示模板**，引导 AI 进行调试
 - **人类可读输出** —— 混合模式、深度函数、拓扑类型均以名称而非数字显示
 - **GPU 特性检测** —— 根据驱动名称自动识别 Adreno/Mali/PowerVR/Apple 特有的问题
@@ -164,6 +165,30 @@ build/x64/
 
 ### 典型工具调用流程
 
+工具按"从总体到细节"五层设计，引导 AI 逐步深入：
+
+```
+Layer 0 — 打开 & 元信息:
+  open_capture → get_capture_info → get_api_properties → get_frame_info
+
+Layer 1 — 帧级诊断入口:
+  get_diagnostic_overview → get_debug_messages
+
+Layer 2 — 帧结构导航:
+  get_frame_overview → list_actions → analyze_render_passes → search_actions
+
+Layer 3 — 事件级分析:
+  set_event → get_draw_call_state → get_pipeline_state → get_shader_bindings
+  → get_descriptor_access → get_vertex_inputs
+
+Layer 4 — 数据深挖:
+  disassemble_shader → get_cbuffer_contents → get_texture_histogram
+  → pixel_history → debug_shader_at_pixel → debug_vertex → debug_compute_thread
+
+Layer 5 — 专项诊断:
+  diagnose_negative_values → diagnose_precision_issues → diagnose_mobile_risks
+```
+
 ```
 open_capture("frame.rdc")                     # 加载捕获文件
 ├── get_capture_info()                         # API、GPU、已知 GPU 问题
@@ -231,7 +256,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `list_resources` | 所有命名资源（可按类型、名称模式筛选） |
 | `get_resource_usage` | 查询哪些事件读写了指定资源 |
 
-### 数据提取（8 个）
+### 数据提取（9 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -243,6 +268,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `export_draw_textures` | 批量导出 Draw Call 绑定的所有纹理 |
 | `save_render_target` | 保存指定事件处的 RT 快照（颜色 + 可选深度） |
 | `export_mesh` | 导出网格为 OBJ（包含位置、法线、UV） |
+| `get_texture_histogram` | **新增** 纹理直方图（256 bucket），快速判断 HDR 溢出/曝光分布 |
 
 ### Shader 分析（3 个）
 
@@ -252,7 +278,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `get_shader_reflection` | 输入/输出签名、资源绑定布局 |
 | `get_cbuffer_contents` | 常量缓冲区变量的实际值，支持 `filter` 按名称筛选 |
 
-### 高级功能（6 个）
+### 高级功能（8 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -262,6 +288,8 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `analyze_render_passes` | 自动检测渲染 Pass 边界 |
 | `sample_pixel_region` | 均匀网格采样 RT 区域 —— 检测 NaN/Inf/负值/过曝 |
 | `debug_shader_at_pixel` | 逐像素 Shader 调试，返回变量追踪信息 |
+| `debug_vertex` | **新增** 顶点着色器调试，追踪顶点变换/蒙皮问题 |
+| `debug_compute_thread` | **新增** Compute Shader 线程调试 |
 
 ### 性能分析（4 个）
 
@@ -280,6 +308,17 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `diagnose_precision_issues` | 检查 R11G11B10 符号位丢失、浅深度缓冲区、SRGB/线性不匹配 |
 | `diagnose_reflection_mismatch` | 对比反射 Pass 与主场景 Draw —— 查找 Shader/混合/格式差异 |
 | `diagnose_mobile_risks` | 全面检查移动端风险（精度/性能/兼容性/GPU 特定问题） |
+
+### 检查工具（6 个）—— 新增
+
+| 工具 | 说明 |
+|------|------|
+| `get_debug_messages` | 获取 API 验证层和驱动的调试/诊断消息，按严重性排序 |
+| `get_api_properties` | 查询 API 能力：是否支持 pixel history、shader debugging、GPU 厂商等 |
+| `get_frame_info` | 帧精确信息：捕获时间、文件大小、FrameStatistics |
+| `get_diagnostic_overview` | **一站式帧诊断总览** —— 聚合调试消息、精度风险、GPU 特性、帧统计于一次调用 |
+| `get_descriptor_access` | 当前事件的描述符访问详情（D3D12/Vulkan 现代绑定模型） |
+| `get_resource_details` | 资源完整信息：父/派生资源关系、精确字节大小、使用摘要 |
 
 ## 提示模板
 
@@ -301,7 +340,7 @@ renderdoc-mcp/
 │   │   ├── server.py           # FastMCP 服务器，提示模板定义
 │   │   ├── session.py          # 捕获生命周期，资源缓存
 │   │   ├── util.py             # 序列化，枚举映射，模块加载器
-│   │   └── tools/              # 9 个工具模块（共 42 个工具）
+│   │   └── tools/              # 10 个工具模块（共 51 个工具）
 │   ├── tests/
 │   └── pyproject.toml
 ├── build/                      # 构建产物（renderdoc.pyd, .dll）

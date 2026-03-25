@@ -341,6 +341,213 @@ def register(mcp: FastMCP):
         return to_json(result)
 
     @mcp.tool()
+    def debug_vertex(
+        event_id: int,
+        vertex_id: int,
+        instance_id: int = 0,
+        index: int = 0,
+        view: int = 0,
+        watch_variables: Optional[list[str]] = None,
+    ) -> str:
+        """Debug the vertex shader at a specific vertex using RenderDoc's shader debugger.
+
+        Executes the vertex shader for the given vertex and returns intermediate variable
+        values at each step. Useful for tracing vertex transform issues, skinning bugs,
+        or incorrect vertex attribute reads.
+
+        Note: Shader debugging may not be supported for all API/GPU combinations.
+
+        Args:
+            event_id: The event ID of the draw call.
+            vertex_id: The vertex ID to debug.
+            instance_id: Instance ID (default 0).
+            index: Index value (default 0).
+            view: Multiview index (default 0).
+            watch_variables: Optional list of variable names to focus on.
+                             If omitted, all variables are returned (may be large).
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+        err = session.set_event(event_id)
+        if err:
+            return to_json(err)
+
+        state = session.controller.GetPipelineState()
+        refl = state.GetShaderReflection(rd.ShaderStage.Vertex)
+        if refl is None:
+            return to_json(make_error("No vertex shader bound at this event", "API_ERROR"))
+
+        result: dict = {
+            "event_id": event_id,
+            "vertex_id": vertex_id,
+            "instance_id": instance_id,
+            "stage": "vertex",
+            "shader_resource_id": str(refl.resourceId),
+            "entry_point": refl.entryPoint,
+        }
+
+        # Attempt shader debugging
+        trace_result: dict | None = None
+        debug_error: str | None = None
+        try:
+            shader_debug = session.controller.DebugVertex(vertex_id, instance_id, index, view)
+
+            if shader_debug is not None and hasattr(shader_debug, "states") and shader_debug.states:
+                states = shader_debug.states
+                steps: list[dict] = []
+
+                for step_state in states:
+                    step: dict = {}
+                    try:
+                        changed = []
+                        if hasattr(step_state, "locals"):
+                            for var in step_state.locals:
+                                vname = var.name
+                                if watch_variables and not any(w.lower() in vname.lower() for w in watch_variables):
+                                    continue
+                                sv = serialize_shader_variable(var)
+                                val = sv.get("value", [])
+                                if isinstance(val, list):
+                                    flat = [v for v in val if isinstance(v, (int, float))]
+                                    if any(math.isnan(v) for v in flat):
+                                        sv["warning"] = f"⚠️ {vname} contains NaN"
+                                    elif any(math.isinf(v) for v in flat):
+                                        sv["warning"] = f"⚠️ {vname} contains Inf"
+                                changed.append(sv)
+                        if changed:
+                            step["variables"] = changed
+                    except Exception:
+                        pass
+                    if step:
+                        steps.append(step)
+
+                trace_result = {
+                    "steps_with_changes": len(steps),
+                    "trace": steps[:200],
+                }
+            else:
+                debug_error = "DebugVertex returned no trace data (may not be supported for this API/GPU)"
+        except Exception as e:
+            debug_error = f"Vertex shader debugging failed: {type(e).__name__}: {e}"
+
+        if trace_result is not None:
+            result["debug_trace"] = trace_result
+        else:
+            result["debug_note"] = debug_error or "Shader trace unavailable"
+            result["fallback_info"] = {
+                "input_signature": [s.semanticIdxName or s.varName for s in refl.inputSignature],
+                "output_signature": [s.semanticIdxName or s.varName for s in refl.outputSignature],
+                "suggestion": "Use get_post_vs_data to inspect transformed vertices, or get_cbuffer_contents to check constants",
+            }
+
+        return to_json(result)
+
+    @mcp.tool()
+    def debug_compute_thread(
+        event_id: int,
+        group_id: Optional[list[int]] = None,
+        thread_id: Optional[list[int]] = None,
+        watch_variables: Optional[list[str]] = None,
+    ) -> str:
+        """Debug a compute shader thread using RenderDoc's shader debugger.
+
+        Executes the compute shader for the given group and thread IDs, returning
+        intermediate variable values. Useful for tracing compute dispatch issues.
+
+        Note: Shader debugging may not be supported for all API/GPU combinations.
+
+        Args:
+            event_id: The event ID of the dispatch call.
+            group_id: Work group ID as [x, y, z] (default [0, 0, 0]).
+            thread_id: Thread ID within the group as [x, y, z] (default [0, 0, 0]).
+            watch_variables: Optional list of variable names to focus on.
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+        err = session.set_event(event_id)
+        if err:
+            return to_json(err)
+
+        state = session.controller.GetPipelineState()
+        refl = state.GetShaderReflection(rd.ShaderStage.Compute)
+        if refl is None:
+            return to_json(make_error("No compute shader bound at this event", "API_ERROR"))
+
+        gid = group_id or [0, 0, 0]
+        tid = thread_id or [0, 0, 0]
+        # Ensure 3-element tuples
+        gid = (gid + [0, 0, 0])[:3]
+        tid = (tid + [0, 0, 0])[:3]
+
+        result: dict = {
+            "event_id": event_id,
+            "group_id": gid,
+            "thread_id": tid,
+            "stage": "compute",
+            "shader_resource_id": str(refl.resourceId),
+            "entry_point": refl.entryPoint,
+        }
+
+        trace_result: dict | None = None
+        debug_error: str | None = None
+        try:
+            shader_debug = session.controller.DebugThread(tuple(gid), tuple(tid))
+
+            if shader_debug is not None and hasattr(shader_debug, "states") and shader_debug.states:
+                states = shader_debug.states
+                steps: list[dict] = []
+
+                for step_state in states:
+                    step: dict = {}
+                    try:
+                        changed = []
+                        if hasattr(step_state, "locals"):
+                            for var in step_state.locals:
+                                vname = var.name
+                                if watch_variables and not any(w.lower() in vname.lower() for w in watch_variables):
+                                    continue
+                                sv = serialize_shader_variable(var)
+                                val = sv.get("value", [])
+                                if isinstance(val, list):
+                                    flat = [v for v in val if isinstance(v, (int, float))]
+                                    if any(math.isnan(v) for v in flat):
+                                        sv["warning"] = f"⚠️ {vname} contains NaN"
+                                    elif any(math.isinf(v) for v in flat):
+                                        sv["warning"] = f"⚠️ {vname} contains Inf"
+                                changed.append(sv)
+                        if changed:
+                            step["variables"] = changed
+                    except Exception:
+                        pass
+                    if step:
+                        steps.append(step)
+
+                trace_result = {
+                    "steps_with_changes": len(steps),
+                    "trace": steps[:200],
+                }
+            else:
+                debug_error = "DebugThread returned no trace data (may not be supported for this API/GPU)"
+        except Exception as e:
+            debug_error = f"Compute shader debugging failed: {type(e).__name__}: {e}"
+
+        if trace_result is not None:
+            result["debug_trace"] = trace_result
+        else:
+            result["debug_note"] = debug_error or "Shader trace unavailable"
+            result["fallback_info"] = {
+                "constant_blocks": [cb.name for cb in refl.constantBlocks],
+                "read_write_resources": [rw.name for rw in refl.readWriteResources],
+                "suggestion": "Use get_cbuffer_contents and get_shader_bindings to inspect compute shader state",
+            }
+
+        return to_json(result)
+
+    @mcp.tool()
     def pixel_history(
         resource_id: str,
         x: int,

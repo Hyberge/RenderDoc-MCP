@@ -298,7 +298,7 @@ def serialize_action_detail(action, structured_file) -> dict:
 
 def serialize_texture_desc(tex) -> dict:
     """Serialize a TextureDescription to a dict."""
-    return {
+    result = {
         "resource_id": str(tex.resourceId),
         "name": tex.name if hasattr(tex, "name") else "",
         "width": tex.width,
@@ -312,16 +312,35 @@ def serialize_texture_desc(tex) -> dict:
         "mssamp": tex.msSamp,
         "creation_flags": tex.creationFlags,
     }
+    # Add precise byte size if available (more accurate than heuristic)
+    try:
+        if hasattr(tex, "byteSize") and tex.byteSize > 0:
+            result["byte_size"] = tex.byteSize
+    except Exception:
+        pass
+    # Add cubemap flag if available
+    try:
+        if hasattr(tex, "cubemap"):
+            result["cubemap"] = tex.cubemap
+    except Exception:
+        pass
+    return result
 
 
 def serialize_buffer_desc(buf) -> dict:
     """Serialize a BufferDescription to a dict."""
-    return {
+    result = {
         "resource_id": str(buf.resourceId),
         "name": buf.name if hasattr(buf, "name") else "",
         "length": buf.length,
         "creation_flags": buf.creationFlags,
     }
+    try:
+        if hasattr(buf, "gpuAddress") and buf.gpuAddress:
+            result["gpu_address"] = f"0x{buf.gpuAddress:x}"
+    except Exception:
+        pass
+    return result
 
 
 def serialize_resource_desc(res) -> dict:

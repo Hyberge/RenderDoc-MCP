@@ -244,7 +244,7 @@ def register(mcp: FastMCP):
 
         if all_slices and tex_desc is not None:
             num_slices = max(tex_desc.arraysize, 1)
-            is_cubemap = num_slices == 6 or (hasattr(tex_desc, "dimension") and "Cube" in str(tex_desc.dimension))
+            is_cubemap = getattr(tex_desc, "cubemap", False) or num_slices == 6 or (hasattr(tex_desc, "dimension") and "Cube" in str(tex_desc.dimension))
             per_slice = []
             for s in range(num_slices):
                 try:
@@ -675,3 +675,103 @@ def register(mcp: FastMCP):
             "uvs": len(uvs),
             "triangles": len(triangles),
         })
+
+    @mcp.tool()
+    def get_texture_histogram(
+        resource_id: str,
+        min_val: float = 0.0,
+        max_val: float = 1.0,
+        channels: str = "rgb",
+        event_id: Optional[int] = None,
+    ) -> str:
+        """Get the histogram (256 buckets) of a texture's color distribution.
+
+        Useful for quickly analyzing brightness distribution, detecting HDR overflow,
+        checking if values are clamped, or identifying underexposed/overexposed regions.
+
+        Args:
+            resource_id: The texture resource ID string.
+            min_val: Minimum value for histogram range (default 0.0).
+            max_val: Maximum value for histogram range (default 1.0).
+            channels: Which channels to include: "rgb", "r", "g", "b", "a" (default "rgb").
+            event_id: Optional event ID to navigate to first.
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+        err = session.ensure_event(event_id)
+        if err:
+            return to_json(err)
+
+        tex_id = session.resolve_resource_id(resource_id)
+        if tex_id is None:
+            return to_json(make_error(f"Texture resource '{resource_id}' not found", "INVALID_RESOURCE_ID"))
+
+        # Build channel bitmask: R=1, G=2, B=4, A=8
+        channel_map = {"r": True, "g": True, "b": True, "a": False}
+        ch_lower = channels.lower()
+        if ch_lower == "rgb":
+            channel_map = {"r": True, "g": True, "b": True, "a": False}
+        elif ch_lower == "rgba":
+            channel_map = {"r": True, "g": True, "b": True, "a": True}
+        elif ch_lower in ("r", "g", "b", "a"):
+            channel_map = {"r": ch_lower == "r", "g": ch_lower == "g",
+                           "b": ch_lower == "b", "a": ch_lower == "a"}
+
+        try:
+            histogram = session.controller.GetHistogram(
+                tex_id,
+                rd.Subresource(0, 0, 0),
+                rd.CompType.Typeless,
+                min_val, max_val,
+                channel_map["r"], channel_map["g"], channel_map["b"], channel_map["a"],
+            )
+        except Exception as e:
+            return to_json(make_error(f"GetHistogram failed: {type(e).__name__}: {e}"))
+
+        # Convert to list
+        buckets = list(histogram)
+
+        # Compute summary statistics
+        total_pixels = sum(buckets)
+        peak_bucket = max(range(len(buckets)), key=lambda i: buckets[i]) if buckets else 0
+        peak_value = min_val + (peak_bucket + 0.5) * (max_val - min_val) / max(len(buckets), 1)
+
+        # Check distribution characteristics
+        bucket_range = max_val - min_val
+        lower_quarter = sum(buckets[:64])
+        upper_quarter = sum(buckets[192:])
+        middle_half = sum(buckets[64:192])
+
+        characteristics: list[str] = []
+        if total_pixels > 0:
+            if lower_quarter / total_pixels > 0.8:
+                characteristics.append("heavily concentrated in dark values — possible underexposure")
+            if upper_quarter / total_pixels > 0.8:
+                characteristics.append("heavily concentrated in bright values — possible overexposure or HDR overflow")
+            if buckets[-1] > total_pixels * 0.1 and max_val <= 1.0:
+                characteristics.append(f"significant pixel count ({buckets[-1]}) in max bucket — values may be clamped at {max_val}")
+            if buckets[0] > total_pixels * 0.1 and min_val >= 0.0:
+                characteristics.append(f"significant pixel count ({buckets[0]}) in min bucket — values may be clamped at {min_val}")
+
+        # Compact the histogram for output (256 values is fine for JSON)
+        result: dict = {
+            "resource_id": resource_id,
+            "range": {"min": min_val, "max": max_val},
+            "channels": channels,
+            "total_pixels": total_pixels,
+            "bucket_count": len(buckets),
+            "histogram": buckets,
+            "peak_bucket": peak_bucket,
+            "peak_value": round(peak_value, 4),
+        }
+        if characteristics:
+            result["characteristics"] = characteristics
+
+        # Add texture info
+        tex_desc = session.get_texture_desc(resource_id)
+        if tex_desc is not None:
+            result["texture"] = f"{tex_desc.width}x{tex_desc.height} {tex_desc.format.Name()}"
+
+        return to_json(result)

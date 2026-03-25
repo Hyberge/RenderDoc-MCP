@@ -145,33 +145,41 @@ def register(mcp: FastMCP):
         textures = controller.GetTextures()
         tex_total_bytes = 0
         for tex in textures:
-            # Estimate: width * height * depth * arraysize * bpp (assume 4 bytes as fallback)
-            bpp = 4
-            fmt_name = str(tex.format.Name()).upper()
-            if "R16G16B16A16" in fmt_name:
-                bpp = 8
-            elif "R32G32B32A32" in fmt_name:
-                bpp = 16
-            elif "R8G8B8A8" in fmt_name or "B8G8R8A8" in fmt_name:
+            # Prefer precise byteSize from RenderDoc API if available
+            size = 0
+            try:
+                if hasattr(tex, "byteSize") and tex.byteSize > 0:
+                    size = tex.byteSize
+            except Exception:
+                pass
+            if size == 0:
+                # Fallback: heuristic estimate
                 bpp = 4
-            elif "R16G16" in fmt_name:
-                bpp = 4
-            elif "R32" in fmt_name and "G32" not in fmt_name:
-                bpp = 4
-            elif "R16" in fmt_name and "G16" not in fmt_name:
-                bpp = 2
-            elif "R8" in fmt_name and "G8" not in fmt_name:
-                bpp = 1
-            elif "BC" in fmt_name or "ETC" in fmt_name or "ASTC" in fmt_name:
-                bpp = 1  # compressed: ~1 byte per pixel average
-            elif "D24" in fmt_name or "D32" in fmt_name:
-                bpp = 4
-            elif "D16" in fmt_name:
-                bpp = 2
-            size = tex.width * tex.height * max(tex.depth, 1) * max(tex.arraysize, 1) * bpp
-            # Account for mip chain (~1.33x)
-            if tex.mips > 1:
-                size = int(size * 1.33)
+                fmt_name = str(tex.format.Name()).upper()
+                if "R16G16B16A16" in fmt_name:
+                    bpp = 8
+                elif "R32G32B32A32" in fmt_name:
+                    bpp = 16
+                elif "R8G8B8A8" in fmt_name or "B8G8R8A8" in fmt_name:
+                    bpp = 4
+                elif "R16G16" in fmt_name:
+                    bpp = 4
+                elif "R32" in fmt_name and "G32" not in fmt_name:
+                    bpp = 4
+                elif "R16" in fmt_name and "G16" not in fmt_name:
+                    bpp = 2
+                elif "R8" in fmt_name and "G8" not in fmt_name:
+                    bpp = 1
+                elif "BC" in fmt_name or "ETC" in fmt_name or "ASTC" in fmt_name:
+                    bpp = 1  # compressed: ~1 byte per pixel average
+                elif "D24" in fmt_name or "D32" in fmt_name:
+                    bpp = 4
+                elif "D16" in fmt_name:
+                    bpp = 2
+                size = tex.width * tex.height * max(tex.depth, 1) * max(tex.arraysize, 1) * bpp
+                # Account for mip chain (~1.33x)
+                if tex.mips > 1:
+                    size = int(size * 1.33)
             tex_total_bytes += size
 
         # Buffer memory
