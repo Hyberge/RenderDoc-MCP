@@ -13,6 +13,13 @@ from renderdoc_mcp.util import (
     rd,
     to_json,
     make_error,
+    enum_str,
+    GRAPHICS_API_MAP,
+    GPU_VENDOR_MAP,
+    SHADER_STAGE_REVERSE_MAP,
+    DESCRIPTOR_TYPE_MAP,
+    RESOURCE_TYPE_MAP,
+    RESOURCE_USAGE_MAP,
 )
 
 
@@ -81,9 +88,9 @@ def register(mcp: FastMCP):
         props = controller.GetAPIProperties()
 
         result = {
-            "pipeline_type": str(props.pipelineType).replace("GraphicsAPI.", ""),
-            "local_renderer": str(props.localRenderer).replace("GraphicsAPI.", ""),
-            "vendor": str(props.vendor).replace("GPUVendor.", ""),
+            "pipeline_type": enum_str(props.pipelineType, GRAPHICS_API_MAP, "GraphicsAPI."),
+            "local_renderer": enum_str(props.localRenderer, GRAPHICS_API_MAP, "GraphicsAPI."),
+            "vendor": enum_str(props.vendor, GPU_VENDOR_MAP, "GPUVendor."),
             "pixel_history_supported": props.pixelHistory,
             "shader_debugging_supported": props.shaderDebugging,
             "degraded": props.degraded,
@@ -118,59 +125,78 @@ def register(mcp: FastMCP):
         controller = session.controller
 
         try:
-            frame_infos = controller.GetFrameInfo()
+            frame = controller.GetFrameInfo()
         except Exception as e:
             return to_json(make_error(f"GetFrameInfo failed: {type(e).__name__}: {e}"))
 
-        # GetFrameInfo returns a list of FrameDescription; usually just one frame
-        results = []
-        for frame in frame_infos:
-            entry: dict = {
-                "frame_number": frame.frameNumber,
-            }
-            # File sizes
-            try:
-                entry["compressed_file_size"] = frame.compressedFileSize
-                entry["uncompressed_file_size"] = frame.uncompressedFileSize
-            except Exception:
-                pass
+        # GetFrameInfo returns a single FrameDescription
+        entry: dict = {
+            "frame_number": frame.frameNumber,
+        }
+        # File sizes
+        try:
+            entry["compressed_file_size"] = frame.compressedFileSize
+            entry["uncompressed_file_size"] = frame.uncompressedFileSize
+        except Exception:
+            pass
 
-            # Capture time
-            try:
-                entry["capture_time"] = frame.captureTime
-            except Exception:
-                pass
+        # Capture time
+        try:
+            entry["capture_time"] = frame.captureTime
+        except Exception:
+            pass
 
-            # Frame statistics
-            try:
-                stats = frame.stats
-                stat_dict: dict = {}
-                # Try to extract common stat fields
+        # Frame statistics
+        try:
+            stats = frame.stats
+            recorded = getattr(stats, "recorded", False)
+            if not recorded:
+                entry["statistics"] = {
+                    "recorded": False,
+                    "note": "Frame statistics were not collected during capture. "
+                            "Enable statistics collection in RenderDoc capture settings to get draw/dispatch/bind counts.",
+                }
+            else:
+                stat_dict: dict = {"recorded": True}
                 for attr in ["draws", "dispatches", "indices", "instances",
                              "vertices", "primitives", "drawCalls",
                              "constants", "samplers", "resourceBinds",
                              "blendChanges", "depthStencilChanges", "rasterChanges",
                              "outputChanges"]:
                     val = getattr(stats, attr, None)
-                    if val is not None:
+                    if val is None:
+                        continue
+                    # Simple scalar
+                    if isinstance(val, (int, float, bool, str)):
                         stat_dict[attr] = val
+                    else:
+                        # SWIG sub-object (e.g. DrawcallStats) — extract its numeric attrs
+                        try:
+                            sub = {}
+                            for sa in dir(val):
+                                if sa.startswith("_"):
+                                    continue
+                                sv = getattr(val, sa, None)
+                                if isinstance(sv, (int, float)):
+                                    sub[sa] = sv
+                            if sub:
+                                stat_dict[attr] = sub
+                        except Exception:
+                            stat_dict[attr] = str(val)
                 if stat_dict:
                     entry["statistics"] = stat_dict
-            except Exception:
-                pass
+                entry["statistics"] = stat_dict
+        except Exception:
+            pass
 
-            # Debug messages not bound to specific events
-            try:
-                if frame.debugMessages:
-                    entry["frame_debug_messages"] = len(frame.debugMessages)
-            except Exception:
-                pass
+        # Debug messages not bound to specific events
+        try:
+            if frame.debugMessages:
+                entry["frame_debug_messages"] = len(frame.debugMessages)
+        except Exception:
+            pass
 
-            results.append(entry)
-
-        if len(results) == 1:
-            return to_json(results[0])
-        return to_json({"frames": results, "count": len(results)})
+        return to_json(entry)
 
     @mcp.tool()
     def get_diagnostic_overview() -> str:
@@ -195,8 +221,8 @@ def register(mcp: FastMCP):
         try:
             props = controller.GetAPIProperties()
             result["api"] = {
-                "type": str(props.pipelineType).replace("GraphicsAPI.", ""),
-                "vendor": str(props.vendor).replace("GPUVendor.", ""),
+                "type": enum_str(props.pipelineType, GRAPHICS_API_MAP, "GraphicsAPI."),
+                "vendor": enum_str(props.vendor, GPU_VENDOR_MAP, "GPUVendor."),
                 "pixel_history": props.pixelHistory,
                 "shader_debugging": props.shaderDebugging,
                 "degraded": props.degraded,
@@ -349,11 +375,11 @@ def register(mcp: FastMCP):
         for acc in accesses:
             entry: dict = {}
             try:
-                entry["stage"] = str(acc.stage).replace("ShaderStage.", "")
+                entry["stage"] = enum_str(acc.stage, SHADER_STAGE_REVERSE_MAP, "ShaderStage.")
             except Exception:
                 entry["stage"] = "unknown"
             try:
-                entry["type"] = str(acc.type).replace("DescriptorType.", "")
+                entry["type"] = enum_str(acc.type, DESCRIPTOR_TYPE_MAP, "DescriptorType.")
             except Exception:
                 pass
             try:
@@ -416,7 +442,7 @@ def register(mcp: FastMCP):
 
         result: dict = {
             "resource_id": resource_id,
-            "type": str(target.type).replace("ResourceType.", ""),
+            "type": enum_str(target.type, RESOURCE_TYPE_MAP, "ResourceType."),
         }
 
         # Name
@@ -495,7 +521,7 @@ def register(mcp: FastMCP):
                 usages = controller.GetUsage(rid)
                 usage_types: dict[str, int] = {}
                 for u in usages:
-                    uname = str(u.usage).replace("ResourceUsage.", "")
+                    uname = enum_str(u.usage, RESOURCE_USAGE_MAP, "Usage.")
                     usage_types[uname] = usage_types.get(uname, 0) + 1
                 result["usage_summary"] = {
                     "total_events": len(usages),

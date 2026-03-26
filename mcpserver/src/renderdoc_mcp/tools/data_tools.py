@@ -725,7 +725,7 @@ def register(mcp: FastMCP):
                 rd.Subresource(0, 0, 0),
                 rd.CompType.Typeless,
                 min_val, max_val,
-                channel_map["r"], channel_map["g"], channel_map["b"], channel_map["a"],
+                (channel_map["r"], channel_map["g"], channel_map["b"], channel_map["a"]),
             )
         except Exception as e:
             return to_json(make_error(f"GetHistogram failed: {type(e).__name__}: {e}"))

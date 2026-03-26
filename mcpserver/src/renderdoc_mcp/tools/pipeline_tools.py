@@ -76,39 +76,49 @@ def _serialize_pipeline_state(state) -> dict:
     except Exception as e:
         warnings.append(f"topology: {type(e).__name__}: {e}")
 
-    # Viewports and scissors
+    # Viewports — GetViewport(index) returns a single Viewport
     try:
-        viewports = state.GetViewports()
-        result["viewports"] = [_serialize_viewport(vp) for vp in viewports]
+        viewports = []
+        for i in range(16):
+            try:
+                vp = state.GetViewport(i)
+                if vp.width == 0 and vp.height == 0:
+                    break
+                viewports.append(_serialize_viewport(vp))
+            except Exception:
+                break
+        result["viewports"] = viewports
     except Exception as e:
         warnings.append(f"viewports: {type(e).__name__}: {e}")
 
+    # Scissors — GetScissor(index) returns a single Scissor
     try:
-        scissors = state.GetScissors()
-        result["scissors"] = [_serialize_scissor(sc) for sc in scissors]
+        scissors = []
+        for i in range(16):
+            try:
+                sc = state.GetScissor(i)
+                if sc.width == 0 and sc.height == 0:
+                    break
+                scissors.append(_serialize_scissor(sc))
+            except Exception:
+                break
+        result["scissors"] = scissors
     except Exception as e:
         warnings.append(f"scissors: {type(e).__name__}: {e}")
 
-    # Rasterizer state
+    # Rasterizer state — PipeState doesn't have GetRasterizer(), access API-specific state
     try:
-        raster = state.GetRasterizer()
-        result["rasterizer"] = {
-            "fill_mode": enum_str(raster.fillMode, FILL_MODE_MAP, "FillMode."),
-            "cull_mode": enum_str(raster.cullMode, CULL_MODE_MAP, "CullMode."),
-            "front_ccw": raster.frontCCW,
-            "depth_bias": raster.depthBias,
-            "depth_clip": raster.depthClip,
-            "scissor_enable": raster.scissorEnable,
-            "multisample_enable": raster.multisampleEnable,
-        }
+        raster_info = _get_rasterizer_state(state)
+        if raster_info:
+            result["rasterizer"] = raster_info
     except Exception as e:
         warnings.append(f"rasterizer: {type(e).__name__}: {e}")
 
-    # Color blend
+    # Color blend — GetColorBlends() returns List[ColorBlend] directly
     try:
-        cb = state.GetColorBlend()
+        color_blends = state.GetColorBlends()
         blends = []
-        for b in cb.blends:
+        for b in color_blends:
             color_eq = _serialize_blend_eq(b.colorBlend)
             alpha_eq = _serialize_blend_eq(b.alphaBlend)
             entry = {
@@ -123,29 +133,36 @@ def _serialize_pipeline_state(state) -> dict:
                     alpha_eq["source"], alpha_eq["destination"], alpha_eq["operation"],
                 )
             blends.append(entry)
-        result["color_blend"] = {
-            "blend_factor": [cb.blendFactor.x, cb.blendFactor.y, cb.blendFactor.z, cb.blendFactor.w],
-            "blends": blends,
-        }
+        result["color_blend"] = {"blends": blends}
     except Exception as e:
         warnings.append(f"color_blend: {type(e).__name__}: {e}")
 
-    # Depth state
+    # Depth state — PipeState doesn't have GetDepthState(), access API-specific state
     try:
-        ds = state.GetDepthState()
-        result["depth_state"] = {
-            "depth_enable": ds.depthEnable,
-            "depth_function": enum_str(ds.depthFunction, COMPARE_FUNC_MAP, "CompareFunc."),
-            "depth_write_mask": ds.depthWrites,
-        }
+        depth_info = _get_depth_state(state)
+        if depth_info:
+            result["depth_state"] = depth_info
     except Exception as e:
         warnings.append(f"depth_state: {type(e).__name__}: {e}")
 
-    # Stencil state
+    # Stencil state — GetStencilFaces() returns (front, back) pair
     try:
-        ss = state.GetStencilState()
+        stencil_faces = state.GetStencilFaces()
+        front = stencil_faces[0]
+        back = stencil_faces[1]
         result["stencil_state"] = {
-            "stencil_enable": ss.stencilEnable,
+            "front": {
+                "fail_op": enum_str(front.failOperation, STENCIL_OP_MAP, "StencilOp."),
+                "depth_fail_op": enum_str(front.depthFailOperation, STENCIL_OP_MAP, "StencilOp."),
+                "pass_op": enum_str(front.passOperation, STENCIL_OP_MAP, "StencilOp."),
+                "function": enum_str(front.function, COMPARE_FUNC_MAP, "CompareFunc."),
+            },
+            "back": {
+                "fail_op": enum_str(back.failOperation, STENCIL_OP_MAP, "StencilOp."),
+                "depth_fail_op": enum_str(back.depthFailOperation, STENCIL_OP_MAP, "StencilOp."),
+                "pass_op": enum_str(back.passOperation, STENCIL_OP_MAP, "StencilOp."),
+                "function": enum_str(back.function, COMPARE_FUNC_MAP, "CompareFunc."),
+            },
         }
     except Exception as e:
         warnings.append(f"stencil_state: {type(e).__name__}: {e}")
@@ -170,6 +187,143 @@ def _serialize_pipeline_state(state) -> dict:
         result["warnings"] = warnings
 
     return result
+
+
+def _get_api_specific_state(state):
+    """Try to obtain the API-specific pipeline state object."""
+    try:
+        if state.IsCaptureD3D12():
+            return "d3d12", None  # Will access via attributes below
+        if state.IsCaptureD3D11():
+            return "d3d11", None
+        if state.IsCaptureVK():
+            return "vulkan", None
+        if state.IsCaptureGL():
+            return "gl", None
+    except Exception:
+        pass
+    return None, None
+
+
+def _get_rasterizer_state(state) -> dict | None:
+    """Extract rasterizer state from API-specific pipeline state."""
+    try:
+        if state.IsCaptureD3D12():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetD3D12PipelineState()
+            rs = api_state.rasterizer.state
+            return {
+                "fill_mode": enum_str(rs.fillMode, FILL_MODE_MAP, "FillMode."),
+                "cull_mode": enum_str(rs.cullMode, CULL_MODE_MAP, "CullMode."),
+                "front_ccw": rs.frontCCW,
+                "depth_bias": rs.depthBias,
+                "depth_clip": rs.depthClip,
+            }
+    except Exception:
+        pass
+    try:
+        if state.IsCaptureD3D11():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetD3D11PipelineState()
+            rs = api_state.rasterizer.state
+            return {
+                "fill_mode": enum_str(rs.fillMode, FILL_MODE_MAP, "FillMode."),
+                "cull_mode": enum_str(rs.cullMode, CULL_MODE_MAP, "CullMode."),
+                "front_ccw": rs.frontCCW,
+                "depth_bias": rs.depthBias,
+                "depth_clip": rs.depthClip,
+            }
+    except Exception:
+        pass
+    try:
+        if state.IsCaptureVK():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetVulkanPipelineState()
+            rs = api_state.rasterizer
+            return {
+                "fill_mode": enum_str(rs.fillMode, FILL_MODE_MAP, "FillMode."),
+                "cull_mode": enum_str(rs.cullMode, CULL_MODE_MAP, "CullMode."),
+                "front_ccw": rs.frontCCW,
+                "depth_bias": rs.depthBiasEnable,
+            }
+    except Exception:
+        pass
+    try:
+        if state.IsCaptureGL():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetGLPipelineState()
+            rs = api_state.rasterizer.state
+            return {
+                "fill_mode": enum_str(rs.fillMode, FILL_MODE_MAP, "FillMode."),
+                "cull_mode": enum_str(rs.cullMode, CULL_MODE_MAP, "CullMode."),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _get_depth_state(state) -> dict | None:
+    """Extract depth state from API-specific pipeline state."""
+    try:
+        if state.IsCaptureD3D12():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetD3D12PipelineState()
+            ds = api_state.outputMerger.depthStencilState
+            return {
+                "depth_enable": ds.depthEnable,
+                "depth_function": enum_str(ds.depthFunction, COMPARE_FUNC_MAP, "CompareFunc."),
+                "depth_write_mask": ds.depthWrites,
+                "stencil_enable": ds.stencilEnable,
+            }
+    except Exception:
+        pass
+    try:
+        if state.IsCaptureD3D11():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetD3D11PipelineState()
+            ds = api_state.outputMerger.depthStencilState
+            return {
+                "depth_enable": ds.depthEnable,
+                "depth_function": enum_str(ds.depthFunction, COMPARE_FUNC_MAP, "CompareFunc."),
+                "depth_write_mask": ds.depthWrites,
+                "stencil_enable": ds.stencilEnable,
+            }
+    except Exception:
+        pass
+    try:
+        if state.IsCaptureVK():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetVulkanPipelineState()
+            ds = api_state.depthStencil
+            return {
+                "depth_enable": ds.depthTestEnable,
+                "depth_function": enum_str(ds.depthFunction, COMPARE_FUNC_MAP, "CompareFunc."),
+                "depth_write_mask": ds.depthWriteEnable,
+                "stencil_enable": ds.stencilTestEnable,
+            }
+    except Exception:
+        pass
+    try:
+        if state.IsCaptureGL():
+            from renderdoc_mcp.session import get_session
+            session = get_session()
+            api_state = session.controller.GetGLPipelineState()
+            ds = api_state.depthState
+            return {
+                "depth_enable": ds.depthEnable,
+                "depth_function": enum_str(ds.depthFunction, COMPARE_FUNC_MAP, "CompareFunc."),
+                "depth_write_mask": ds.depthWrites,
+            }
+    except Exception:
+        pass
+    return None
 
 
 def register(mcp: FastMCP):
@@ -437,9 +591,9 @@ def _get_draw_state_dict(session, event_id: int) -> dict:
 
     # Blend state (first enabled blend target)
     try:
-        cb = state.GetColorBlend()
-        if cb.blends:
-            b = cb.blends[0]
+        color_blends = state.GetColorBlends()
+        if color_blends:
+            b = color_blends[0]
             color_eq = _serialize_blend_eq(b.colorBlend)
             alpha_eq = _serialize_blend_eq(b.alphaBlend)
             blend_info: dict = {
@@ -460,32 +614,44 @@ def _get_draw_state_dict(session, event_id: int) -> dict:
     except Exception as e:
         warnings.append(f"blend: {type(e).__name__}: {e}")
 
-    # Depth state
+    # Depth state — from API-specific state
     try:
-        ds = state.GetDepthState()
-        result["depth"] = {
-            "test": ds.depthEnable,
-            "write": ds.depthWrites,
-            "func": enum_str(ds.depthFunction, COMPARE_FUNC_MAP, "CompareFunc."),
-        }
+        depth_info = _get_depth_state(state)
+        if depth_info:
+            result["depth"] = {
+                "test": depth_info.get("depth_enable", False),
+                "write": depth_info.get("depth_write_mask", False),
+                "func": depth_info.get("depth_function", "Unknown"),
+            }
     except Exception as e:
         warnings.append(f"depth: {type(e).__name__}: {e}")
 
-    # Stencil state
+    # Stencil state — GetStencilFaces() returns (front, back) pair
     try:
-        ss = state.GetStencilState()
-        result["stencil"] = {"enabled": ss.stencilEnable}
+        stencil_faces = state.GetStencilFaces()
+        front = stencil_faces[0]
+        back = stencil_faces[1]
+        # Check if stencil is effectively enabled (non-trivial ops)
+        has_ops = (int(front.passOperation) != 0 or int(back.passOperation) != 0)
+        result["stencil"] = {"has_operations": has_ops}
+        # Also try getting stencilEnable from API-specific state
+        depth_info = result.get("depth")
+        if depth_info is None:
+            depth_info_full = _get_depth_state(state)
+            if depth_info_full and "stencil_enable" in depth_info_full:
+                result["stencil"]["enabled"] = depth_info_full["stencil_enable"]
     except Exception as e:
         warnings.append(f"stencil: {type(e).__name__}: {e}")
 
-    # Rasterizer
+    # Rasterizer — from API-specific state
     try:
-        raster = state.GetRasterizer()
-        result["rasterizer"] = {
-            "cull": enum_str(raster.cullMode, CULL_MODE_MAP, "CullMode."),
-            "fill": enum_str(raster.fillMode, FILL_MODE_MAP, "FillMode."),
-            "front_ccw": raster.frontCCW,
-        }
+        raster_info = _get_rasterizer_state(state)
+        if raster_info:
+            result["rasterizer"] = {
+                "cull": raster_info.get("cull_mode", "Unknown"),
+                "fill": raster_info.get("fill_mode", "Unknown"),
+                "front_ccw": raster_info.get("front_ccw", False),
+            }
     except Exception as e:
         warnings.append(f"rasterizer: {type(e).__name__}: {e}")
 

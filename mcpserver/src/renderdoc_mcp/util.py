@@ -126,21 +126,56 @@ TEXTURE_DIM_MAP: dict[int, str] = {
 }
 
 RESOURCE_USAGE_MAP: dict[int, str] = {
-    0: "None", 1: "VertexBuffer", 2: "IndexBuffer",
+    0: "Unused", 1: "VertexBuffer", 2: "IndexBuffer",
     3: "VS_Constants", 4: "HS_Constants", 5: "DS_Constants",
     6: "GS_Constants", 7: "PS_Constants", 8: "CS_Constants",
-    9: "All_Constants",
-    10: "StreamOut", 11: "IndirectArg",
-    16: "VS_Resource", 17: "HS_Resource", 18: "DS_Resource",
-    19: "GS_Resource", 20: "PS_Resource", 21: "CS_Resource",
-    22: "All_Resource",
-    32: "VS_RWResource", 33: "HS_RWResource", 34: "DS_RWResource",
-    35: "GS_RWResource", 36: "PS_RWResource", 37: "CS_RWResource",
-    38: "All_RWResource",
-    48: "InputTarget", 49: "ColorTarget", 50: "DepthStencilTarget",
-    64: "Clear", 65: "GenMips", 66: "Resolve", 67: "ResolveSrc",
-    68: "ResolveDst", 69: "Copy", 70: "CopySrc", 71: "CopyDst",
-    72: "Barrier",
+    9: "TS_Constants", 10: "MS_Constants", 11: "All_Constants",
+    12: "StreamOut",
+    13: "VS_Resource", 14: "HS_Resource", 15: "DS_Resource",
+    16: "GS_Resource", 17: "PS_Resource", 18: "CS_Resource",
+    19: "TS_Resource", 20: "MS_Resource", 21: "All_Resource",
+    22: "VS_RWResource", 23: "HS_RWResource", 24: "DS_RWResource",
+    25: "GS_RWResource", 26: "PS_RWResource", 27: "CS_RWResource",
+    28: "TS_RWResource", 29: "MS_RWResource", 30: "All_RWResource",
+    31: "InputTarget", 32: "ColorTarget", 33: "DepthStencilTarget",
+    34: "Indirect", 35: "Clear", 36: "Discard",
+    37: "GenMips", 38: "Resolve", 39: "ResolveSrc",
+    40: "ResolveDst", 41: "Copy", 42: "CopySrc", 43: "CopyDst",
+    44: "Barrier",
+}
+
+# ── API / GPU enum mappings ──
+
+GRAPHICS_API_MAP: dict[int, str] = {
+    0: "D3D11", 1: "D3D12", 2: "OpenGL", 3: "Vulkan",
+}
+
+GPU_VENDOR_MAP: dict[int, str] = {
+    0: "Unknown", 1: "ARM", 2: "AMD", 3: "Broadcom",
+    4: "Imagination", 5: "Intel", 6: "nVidia", 7: "Qualcomm",
+    8: "Verisilicon", 9: "Software", 10: "Samsung",
+}
+
+SHADER_STAGE_REVERSE_MAP: dict[int, str] = {
+    0: "Vertex", 1: "Hull", 2: "Domain", 3: "Geometry",
+    4: "Pixel", 5: "Compute", 6: "Task", 7: "Mesh",
+    8: "RayGen", 9: "Intersection", 10: "AnyHit",
+    11: "ClosestHit", 12: "Miss", 13: "Callable",
+    14: "Count",
+}
+
+DESCRIPTOR_TYPE_MAP: dict[int, str] = {
+    0: "Unknown", 1: "ConstantBuffer", 2: "Sampler",
+    3: "ImageSampler", 4: "Image", 5: "Buffer",
+    6: "TypedBuffer", 7: "ReadWriteImage",
+    8: "ReadWriteTypedBuffer", 9: "ReadWriteBuffer",
+    10: "AccelerationStructure",
+}
+
+RESOURCE_TYPE_MAP: dict[int, str] = {
+    0: "Unknown", 1: "Buffer", 2: "Texture",
+    3: "SwapchainImage", 4: "Shader", 5: "PipelineState",
+    6: "StateObject",
 }
 
 

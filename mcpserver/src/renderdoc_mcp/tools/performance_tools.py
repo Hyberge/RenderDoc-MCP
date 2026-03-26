@@ -508,23 +508,28 @@ def register(mcp: FastMCP):
 
             if "blend" in track:
                 try:
-                    cb = state.GetColorBlend()
-                    b = cb.blends[0] if cb.blends else None
+                    color_blends = state.GetColorBlends()
+                    b = color_blends[0] if color_blends else None
                     cur_state["blend"] = (b.enabled, int(b.colorBlend.source), int(b.colorBlend.destination)) if b else None
                 except Exception:
                     cur_state["blend"] = None
 
             if "depth" in track:
                 try:
-                    ds = state.GetDepthState()
-                    cur_state["depth"] = (ds.depthEnable, int(ds.depthFunction))
+                    from renderdoc_mcp.tools.pipeline_tools import _get_depth_state
+                    depth_info = _get_depth_state(state)
+                    if depth_info:
+                        cur_state["depth"] = (depth_info.get("depth_enable", False), depth_info.get("depth_function", "Unknown"))
+                    else:
+                        cur_state["depth"] = None
                 except Exception:
                     cur_state["depth"] = None
 
             if "cull" in track:
                 try:
-                    raster = state.GetRasterizer()
-                    cur_state["cull"] = int(raster.cullMode)
+                    from renderdoc_mcp.tools.pipeline_tools import _get_rasterizer_state
+                    raster_info = _get_rasterizer_state(state)
+                    cur_state["cull"] = raster_info.get("cull_mode", "Unknown") if raster_info else None
                 except Exception:
                     cur_state["cull"] = None
 
