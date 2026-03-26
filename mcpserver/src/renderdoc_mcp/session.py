@@ -17,6 +17,7 @@ class RenderDocSession:
         self._filepath: str | None = None
         self._current_event: int | None = None
         self._action_map: dict[int, object] = {}
+        self._event_map: dict[int, int] = {}  # eventId → chunkIndex (all API events)
         self._structured_file = None
         self._resource_id_cache: dict[str, object] = {}  # str(resourceId) → resourceId
         self._texture_desc_cache: dict[str, object] = {}  # str(resourceId) → TextureDescription
@@ -56,6 +57,11 @@ class RenderDocSession:
     def action_map(self) -> dict[int, object]:
         """Get the event_id -> ActionDescription mapping."""
         return self._action_map
+
+    @property
+    def event_map(self) -> dict[int, int]:
+        """Get the event_id -> chunkIndex mapping for all API events."""
+        return self._event_map
 
     def require_open(self) -> dict | None:
         """Return an error dict if no capture is open, else None."""
@@ -99,6 +105,10 @@ class RenderDocSession:
         self._action_map = {}
         self._build_action_map(controller.GetRootActions())
 
+        # Build event map (eid → chunkIndex for all API events)
+        self._event_map = {}
+        self._build_event_map(controller.GetRootActions())
+
         # Build resource caches
         self._resource_id_cache = {}
         self._texture_desc_cache = {}
@@ -135,6 +145,16 @@ class RenderDocSession:
             if len(a.children) > 0:
                 self._build_action_map(a.children)
 
+    def _build_event_map(self, actions):
+        """Recursively build eid → chunkIndex mapping from all action events."""
+        NO_CHUNK = 0xFFFFFFFF  # APIEvent.NoChunk
+        for a in actions:
+            for evt in a.events:
+                if evt.chunkIndex != NO_CHUNK:
+                    self._event_map[evt.eventId] = evt.chunkIndex
+            if len(a.children) > 0:
+                self._build_event_map(a.children)
+
     def resolve_resource_id(self, resource_id_str: str):
         """Resolve a resource ID string to a ResourceId object, or None."""
         return self._resource_id_cache.get(resource_id_str)
@@ -156,6 +176,7 @@ class RenderDocSession:
         self._filepath = None
         self._current_event = None
         self._action_map = {}
+        self._event_map = {}
         self._structured_file = None
         self._resource_id_cache = {}
         self._texture_desc_cache = {}

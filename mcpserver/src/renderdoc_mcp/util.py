@@ -469,6 +469,105 @@ def serialize_sig_element(sig) -> dict:
     }
 
 
+def serialize_sd_object(obj, include_type: bool = False, max_depth: int = 8, _depth: int = 0) -> Any:
+    """Recursively serialize an SDObject to a JSON-compatible Python value.
+
+    Handles all SDBasic types: primitives, enums, resources, structs, arrays, etc.
+    Uses NumChildren()/GetChild(i) for safe child access (SWIG-compatible).
+    """
+    if obj is None:
+        return None
+    if _depth >= max_depth:
+        return "<max depth exceeded>"
+
+    try:
+        basetype = int(obj.type.basetype)
+    except Exception:
+        return str(obj)
+
+    # SDBasic enum values:
+    # 0=Chunk, 1=Struct, 2=Array, 3=Null, 4=Buffer, 5=String,
+    # 6=Enum, 7=UnsignedInteger, 8=SignedInteger, 9=Float,
+    # 10=Boolean, 11=Character, 12=Resource, 13=GPUAddress
+
+    if basetype == 3:  # Null
+        return None
+
+    if basetype == 7:  # UnsignedInteger
+        return int(obj.data.basic.u)
+
+    if basetype == 8:  # SignedInteger
+        return int(obj.data.basic.i)
+
+    if basetype == 9:  # Float
+        return float(obj.data.basic.d)
+
+    if basetype == 10:  # Boolean
+        return bool(obj.data.basic.b)
+
+    if basetype == 11:  # Character
+        return str(obj.data.basic.c)
+
+    if basetype == 5:  # String
+        try:
+            return str(obj.data.string)
+        except Exception:
+            return str(obj.data.basic.u)
+
+    if basetype == 6:  # Enum
+        # Prefer the custom string representation (enum name) if available
+        try:
+            flags = int(obj.type.flags)
+            if flags & 0x1:  # HasCustomString
+                s = str(obj.data.string)
+                if s:
+                    return s
+        except Exception:
+            pass
+        return int(obj.data.basic.u)
+
+    if basetype == 12:  # Resource
+        return str(obj.data.basic.id)
+
+    if basetype == 13:  # GPUAddress
+        return f"0x{int(obj.data.basic.u):x}"
+
+    if basetype == 4:  # Buffer
+        try:
+            size = int(obj.type.byteSize)
+            return f"<buffer {size} bytes>"
+        except Exception:
+            return "<buffer>"
+
+    if basetype in (0, 1):  # Chunk or Struct
+        result = {}
+        n = obj.NumChildren()
+        for i in range(n):
+            child = obj.GetChild(i)
+            if child is None:
+                continue
+            key = str(child.name) if child.name else f"[{i}]"
+            value = serialize_sd_object(child, include_type=include_type, max_depth=max_depth, _depth=_depth + 1)
+            if include_type:
+                result[key] = {"type": str(child.type.name), "value": value}
+            else:
+                result[key] = value
+        return result
+
+    if basetype == 2:  # Array
+        result_list = []
+        n = obj.NumChildren()
+        for i in range(n):
+            child = obj.GetChild(i)
+            if child is None:
+                continue
+            result_list.append(serialize_sd_object(child, include_type=include_type, max_depth=max_depth, _depth=_depth + 1))
+        return result_list
+
+    # Fallback
+    return str(obj)
+
+
 def to_json(obj: Any, *, allow_cache: bool = True) -> str:
     """Serialize to compact JSON string, caching oversized results when needed."""
     return prepare_tool_result(obj, allow_cache=allow_cache)

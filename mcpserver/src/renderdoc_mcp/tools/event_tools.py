@@ -13,6 +13,7 @@ from renderdoc_mcp.util import (
     to_json,
     serialize_action,
     serialize_action_detail,
+    serialize_sd_object,
     flags_to_list,
     make_error,
     SHADER_STAGE_MAP,
@@ -317,3 +318,141 @@ def register(mcp: FastMCP):
             session.set_event(saved_event)
 
         return to_json({"matches": results, "count": len(results), "max_results": max_results})
+
+    # ── Helper: serialize a single SDChunk (API call) ──
+
+    def _serialize_api_call(sf, event_id: int, chunk_index: int, include_params: bool) -> dict | None:
+        """Serialize one API call from its SDChunk."""
+        NO_CHUNK = 0xFFFFFFFF
+        if chunk_index == NO_CHUNK:
+            return None
+        try:
+            chunk = sf.chunks[chunk_index]
+        except (IndexError, Exception):
+            return None
+
+        entry: dict = {
+            "event_id": event_id,
+            "name": str(chunk.name),
+        }
+        # Add metadata if available
+        try:
+            md = chunk.metadata
+            if md.durationMicro >= 0:
+                entry["duration_us"] = int(md.durationMicro)
+            if md.threadID:
+                entry["thread_id"] = int(md.threadID)
+        except Exception:
+            pass
+
+        if include_params:
+            params = []
+            try:
+                n = chunk.NumChildren()
+                for i in range(n):
+                    child = chunk.GetChild(i)
+                    if child is None:
+                        continue
+                    params.append({
+                        "name": str(child.name),
+                        "type": str(child.type.name),
+                        "value": serialize_sd_object(child),
+                    })
+            except Exception as exc:
+                params.append({"error": f"Failed to serialize params: {exc}"})
+            entry["params"] = params
+
+        return entry
+
+    @mcp.tool()
+    def get_api_calls_by_action(
+        event_id: int,
+        include_params: bool = True,
+    ) -> str:
+        """Get all API calls associated with a specific action (draw/dispatch/clear/etc).
+
+        Each action in RenderDoc has a list of preceding API events (state setup calls,
+        resource barriers, etc.) that are not visible through list_actions. This tool
+        exposes every raw API call with its full parameter values.
+
+        Args:
+            event_id: The event ID of the action to inspect.
+            include_params: Whether to include full parameter values (default True).
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+
+        action = session.get_action(event_id)
+        if action is None:
+            return to_json(make_error(f"Event ID {event_id} not found in action map", "INVALID_EVENT_ID"))
+
+        sf = session.structured_file
+        api_calls = []
+        for evt in action.events:
+            entry = _serialize_api_call(sf, evt.eventId, evt.chunkIndex, include_params)
+            if entry is not None:
+                api_calls.append(entry)
+
+        return to_json({
+            "action_event_id": event_id,
+            "action_name": action.GetName(sf),
+            "api_calls": api_calls,
+            "total": len(api_calls),
+        })
+
+    @mcp.tool()
+    def get_api_calls_range(
+        start_eid: int,
+        end_eid: int,
+        include_params: bool = True,
+        name_filter: Optional[str] = None,
+    ) -> str:
+        """Get all API calls within an event ID range.
+
+        Returns every raw API call (including non-action calls like SetRootCBV,
+        ResourceBarrier, BeginQuery, etc.) whose event ID falls in [start_eid, end_eid].
+
+        Args:
+            start_eid: Start of the event ID range (inclusive).
+            end_eid: End of the event ID range (inclusive).
+            include_params: Whether to include full parameter values (default True).
+            name_filter: Optional case-insensitive substring to filter by API function name
+                        (e.g. "Barrier", "SetRoot", "BeginQuery").
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+
+        if start_eid > end_eid:
+            return to_json(make_error(
+                f"start_eid ({start_eid}) must be <= end_eid ({end_eid})",
+                "API_ERROR",
+            ))
+
+        sf = session.structured_file
+        event_map = session.event_map
+        name_lower = name_filter.lower() if name_filter else None
+
+        api_calls = []
+        for eid in sorted(event_map.keys()):
+            if eid < start_eid:
+                continue
+            if eid > end_eid:
+                break
+            chunk_index = event_map[eid]
+            entry = _serialize_api_call(sf, eid, chunk_index, include_params)
+            if entry is None:
+                continue
+            if name_lower and name_lower not in entry["name"].lower():
+                continue
+            api_calls.append(entry)
+
+        return to_json({
+            "range": [start_eid, end_eid],
+            "api_calls": api_calls,
+            "total": len(api_calls),
+            "name_filter": name_filter,
+        })

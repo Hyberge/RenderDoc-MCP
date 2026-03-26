@@ -28,6 +28,7 @@ CACHE_PREVIEW_LINES = max(1, int(os.environ.get("RENDERDOC_MCP_CACHE_PREVIEW_LIN
 _PRIMARY_COLLECTION_KEYS = [
     "actions",
     "matches",
+    "api_calls",
     "textures",
     "buffers",
     "resources",
