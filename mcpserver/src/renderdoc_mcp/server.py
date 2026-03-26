@@ -6,7 +6,9 @@ import atexit
 
 from mcp.server.fastmcp import FastMCP
 
+from renderdoc_mcp.runtime import install_tool_runtime_guards
 from renderdoc_mcp.session import get_session
+
 from renderdoc_mcp.tools import (
     session_tools,
     event_tools,
@@ -24,8 +26,10 @@ mcp = FastMCP(
     "renderdoc-mcp",
     instructions="RenderDoc graphics debugger MCP server — analyze GPU frame captures (.rdc) with AI",
 )
+install_tool_runtime_guards(mcp)
 
 # ── Register all tool modules ──
+
 
 session_tools.register(mcp)
 event_tools.register(mcp)

@@ -7,10 +7,13 @@
 ## 特性
 
 - **完全独立运行** —— 自带从源码编译的 `renderdoc.pyd`，**不依赖也不干扰**系统中已安装的 RenderDoc。你可以同时使用系统的 RenderDoc GUI 进行日常调试，两者互不影响
-- **51 个工具**，覆盖完整的 RenderDoc 分析流程，按"从总体到细节"五层设计，契合 AI 分析模式
+- **52 个工具**，覆盖完整的 RenderDoc 分析流程，按"从总体到细节"五层设计，契合 AI 分析模式
 - **10 个高级工具**，一次调用即可完成分析（Draw Call 状态、帧概览、对比、批量导出、像素区域采样等）
-- **6 个检查工具**（新增），提供帧级诊断总览、API 属性查询、调试消息获取、描述符访问等
+- **7 个检查工具**，提供帧级诊断总览、API 属性查询、调试消息获取、描述符访问，以及缓存消息分页查询
+- **统一超时保护** —— 每个 tool 默认带超时报错机制，避免长时间卡死无响应
+- **超长结果自动缓存** —— 输出过大时自动返回 `message_id`，再通过 `get_cached_message` 分页或搜索
 - **3 个内置提示模板**，引导 AI 进行调试
+
 - **人类可读输出** —— 混合模式、深度函数、拓扑类型均以名称而非数字显示
 - **GPU 特性检测** —— 根据驱动名称自动识别 Adreno/Mali/PowerVR/Apple 特有的问题
 - **无头运行** —— 无需 GUI，完全通过 RenderDoc 的 Python Replay API 运行
@@ -309,7 +312,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `diagnose_reflection_mismatch` | 对比反射 Pass 与主场景 Draw —— 查找 Shader/混合/格式差异 |
 | `diagnose_mobile_risks` | 全面检查移动端风险（精度/性能/兼容性/GPU 特定问题） |
 
-### 检查工具（6 个）—— 新增
+### 检查工具（7 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -319,6 +322,8 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `get_diagnostic_overview` | **一站式帧诊断总览** —— 聚合调试消息、精度风险、GPU 特性、帧统计于一次调用 |
 | `get_descriptor_access` | 当前事件的描述符访问详情（D3D12/Vulkan 现代绑定模型） |
 | `get_resource_details` | 资源完整信息：父/派生资源关系、精确字节大小、使用摘要 |
+| `get_cached_message` | 查询超长结果缓存：基于 `message_id` 分页、切换视图或全文搜索 |
+
 
 ## 提示模板
 
@@ -339,8 +344,10 @@ renderdoc-mcp/
 │   ├── src/renderdoc_mcp/
 │   │   ├── server.py           # FastMCP 服务器，提示模板定义
 │   │   ├── session.py          # 捕获生命周期，资源缓存
+│   │   ├── runtime.py          # 统一超时守卫、大结果缓存、分页查询
 │   │   ├── util.py             # 序列化，枚举映射，模块加载器
-│   │   └── tools/              # 10 个工具模块（共 51 个工具）
+│   │   └── tools/              # 10 个工具模块（共 52 个工具）
+
 │   ├── tests/
 │   └── pyproject.toml
 ├── build/                      # 构建产物（renderdoc.pyd, .dll）

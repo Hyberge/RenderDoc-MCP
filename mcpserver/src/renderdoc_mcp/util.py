@@ -7,6 +7,9 @@ import os
 import sys
 from typing import Any
 
+from renderdoc_mcp.runtime import prepare_tool_result
+
+
 
 def load_renderdoc():
     """Load the renderdoc Python module, configuring paths from environment."""
@@ -431,6 +434,7 @@ def serialize_sig_element(sig) -> dict:
     }
 
 
-def to_json(obj: Any) -> str:
-    """Serialize to compact JSON string."""
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+def to_json(obj: Any, *, allow_cache: bool = True) -> str:
+    """Serialize to compact JSON string, caching oversized results when needed."""
+    return prepare_tool_result(obj, allow_cache=allow_cache)
+

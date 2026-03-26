@@ -89,7 +89,85 @@ function Test-Command {
     return $?
 }
 
+function Test-RenderDocSourceReady {
+    param([string]$RootDir)
+
+    $RequiredPaths = @(
+        (Join-Path $RootDir "renderdoc\renderdoc.sln"),
+        (Join-Path $RootDir "renderdoc\qrenderdoc\Code\pyrenderdoc\python.props"),
+        (Join-Path $RootDir "renderdoc\renderdoc\api\replay\version.h")
+    )
+
+    foreach ($Path in $RequiredPaths) {
+        if (-not (Test-Path $Path)) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Ensure-RenderDocSubmodule {
+    param([string]$RootDir)
+
+    Write-Step "Checking RenderDoc source submodule..."
+
+    if (Test-RenderDocSourceReady -RootDir $RootDir) {
+        Write-Success "RenderDoc source submodule is ready"
+        return
+    }
+
+    if (-not (Test-Command "git")) {
+        Write-Error-Exit `
+            "RenderDoc source files are missing, and git is not available in PATH." `
+            "Install git, then run: git submodule update --init --recursive renderdoc"
+    }
+
+    $InsideWorkTree = & git -C $RootDir rev-parse --is-inside-work-tree 2>$null
+    if ($LASTEXITCODE -ne 0 -or $InsideWorkTree.Trim() -ne "true") {
+        Write-Error-Exit `
+            "RenderDoc source files are missing, but the current directory is not a git worktree." `
+            "Clone the repository with submodules, or run from a git checkout and execute: git submodule update --init --recursive renderdoc"
+    }
+
+    $SubmoduleStatus = & git -C $RootDir submodule status -- renderdoc 2>$null
+    if ($LASTEXITCODE -eq 0 -and $SubmoduleStatus) {
+        $StatusPrefix = $SubmoduleStatus.Trim().Substring(0, 1)
+        if ($StatusPrefix -eq "-") {
+            Write-Host "  RenderDoc submodule is not initialized. Updating now..." -ForegroundColor Yellow
+        }
+        elseif ($StatusPrefix -eq "U") {
+            Write-Error-Exit `
+                "RenderDoc submodule is in a conflicted state." `
+                "Resolve submodule conflicts first, then rerun the build script."
+        }
+        else {
+            Write-Host "  RenderDoc source files look incomplete. Re-syncing submodule now..." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "  RenderDoc source files are missing. Running git submodule update..." -ForegroundColor Yellow
+    }
+
+    $SubmoduleUpdateOutput = & git -C $RootDir submodule update --init --recursive renderdoc 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ($SubmoduleUpdateOutput | Out-String)
+        Write-Error-Exit `
+            "Failed to update RenderDoc submodule." `
+            "Run 'git submodule update --init --recursive renderdoc' manually and check your network / git configuration."
+    }
+
+    if (-not (Test-RenderDocSourceReady -RootDir $RootDir)) {
+        Write-Error-Exit `
+            "RenderDoc submodule update completed, but required source files are still missing." `
+            "Check whether the renderdoc submodule checkout is complete, then rerun the build script."
+    }
+
+    Write-Success "RenderDoc source submodule updated successfully"
+}
+
 function Test-FileLocked {
+
     param([string]$FilePath)
     if (-not (Test-Path $FilePath)) { return $false }
     try {
@@ -364,10 +442,17 @@ function Invoke-MSBuildProject {
 
 
 # =============================================================================
+# Step 0: Verify RenderDoc source submodule
+# =============================================================================
+
+Ensure-RenderDocSubmodule -RootDir $ScriptDir
+
+# =============================================================================
 # Step 1: Environment Detection
 # =============================================================================
 
 Write-Step "Detecting Python environment..."
+
 
 $PythonExe = $null
 $PythonPrefix = $null
