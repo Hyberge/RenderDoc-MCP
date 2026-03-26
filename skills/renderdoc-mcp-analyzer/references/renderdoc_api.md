@@ -198,8 +198,12 @@ controller.FreeTrace(trace)
 ```python
 counters = controller.EnumerateCounters()            # 枚举可用计数器
 info = controller.DescribeCounter(counter)           # 描述计数器
+# info.name: str, info.unit: CounterUnit, info.resultType, info.resultByteWidth
+# CounterUnit.Seconds = 1, CounterUnit.Percentage = 2, CounterUnit.Absolute = 0
 results = controller.FetchCounters([counter])        # 获取计数器值
 # result.eventId, result.value.d (double)
+# ⚠️ GPU Duration counter 返回值单位是秒（CounterUnit.Seconds），需 ×1000 转 ms！
+# Counter 数据仅包含叶子 action（draw/dispatch/clear/copy），父节点需递归求和
 ```
 
 ### 调试消息（新增工具使用）

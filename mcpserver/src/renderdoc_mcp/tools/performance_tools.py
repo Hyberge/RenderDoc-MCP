@@ -21,140 +21,211 @@ from renderdoc_mcp.util import (
 
 def register(mcp: FastMCP):
 
+    # ---- internal: fetch GPU timing counter data (cached per session) ----
+    _timing_cache: dict | None = None
+
+    def _fetch_timing_data() -> tuple[dict[int, float], bool]:
+        """Fetch GPU Duration counter data, cached for the session.
+
+        Returns (counter_data_ms, has_real_timing).
+        """
+        nonlocal _timing_cache
+        session = get_session()
+        # Invalidate cache if capture changed
+        cache_key = session.filepath
+        if _timing_cache is not None and _timing_cache.get("_key") == cache_key:
+            return _timing_cache["data"], _timing_cache["real"]
+
+        counter_data: dict[int, float] = {}
+        has_real_timing = False
+        try:
+            counters = session.controller.EnumerateCounters()
+            timing_counter = None
+            timing_unit_is_seconds = False
+            for c in counters:
+                info = session.controller.DescribeCounter(c)
+                if "time" in info.name.lower() or "duration" in info.name.lower():
+                    timing_counter = c
+                    timing_unit_is_seconds = (info.unit == rd.CounterUnit.Seconds)
+                    break
+            if timing_counter is not None:
+                results = session.controller.FetchCounters([timing_counter])
+                for r in results:
+                    value_ms = r.value.d * 1000.0 if timing_unit_is_seconds else r.value.d
+                    counter_data[r.eventId] = value_ms
+                has_real_timing = True
+        except Exception:
+            pass
+
+        _timing_cache = {"_key": cache_key, "data": counter_data, "real": has_real_timing}
+        return counter_data, has_real_timing
+
+    # ---- internal: sum timing for a subtree ----
+    def _sum_timing(action, counter_data: dict[int, float]) -> float:
+        """Recursively sum GPU timing for all leaf descendants."""
+        children = action.children
+        if children and len(children) > 0:
+            return sum(_sum_timing(c, counter_data) for c in children)
+        return counter_data.get(action.eventId, 0.0)
+
+    def _count_leaves(action) -> tuple[int, int, int]:
+        """Return (draw_count, dispatch_count, total_leaf_count) in subtree."""
+        children = action.children
+        if children and len(children) > 0:
+            draws, dispatches, leaves = 0, 0, 0
+            for c in children:
+                d, dp, l = _count_leaves(c)
+                draws += d
+                dispatches += dp
+                leaves += l
+            return draws, dispatches, leaves
+        draws = 1 if (action.flags & rd.ActionFlags.Drawcall) else 0
+        dispatches = 1 if (action.flags & rd.ActionFlags.Dispatch) else 0
+        return draws, dispatches, 1
+
     @mcp.tool()
     def get_pass_timing(
-        granularity: str = "pass",
-        top_n: int = 20,
+        max_depth: int = 2,
+        parent_eid: Optional[int] = None,
+        min_ms: float = 0.0,
     ) -> str:
-        """Get per-render-pass or per-draw-call GPU timing estimates.
+        """Get hierarchical GPU timing like a flame graph.
 
-        Note: True GPU timing requires counter support in the capture. When counters
-        are unavailable, this tool falls back to heuristic estimates based on draw
-        call complexity (vertex count × texture count).
+        Returns the action tree with GPU duration at each level.
+        Use max_depth to control how many levels to show, then drill down
+        into expensive nodes by calling again with parent_eid.
+
+        Typical workflow:
+          1. get_pass_timing()                        → see top-level overview
+          2. get_pass_timing(parent_eid=<expensive>)  → drill into that node
+          3. Repeat until you find the hotspot leaf draw calls
 
         Args:
-            granularity: "pass" (group by render pass, default) or "draw_call" (per draw).
-            top_n: Return only the top N most expensive entries (default 20).
+            max_depth: How many levels deep to return (default 2).
+                       Children beyond this depth are summarized.
+            parent_eid: Event ID of a parent node to drill into.
+                        Only its subtree is returned. Omit to start from root.
+            min_ms: Hide nodes below this threshold in ms (default 0, show all).
         """
         session = get_session()
         err = session.require_open()
         if err:
             return to_json(err)
 
-        # Try GPU counters first
-        counter_data: dict[int, float] = {}
-        has_real_timing = False
-        try:
-            counters = session.controller.EnumerateCounters()
-            timing_counter = None
-            for c in counters:
-                info = session.controller.DescribeCounter(c)
-                if "time" in info.name.lower() or "duration" in info.name.lower():
-                    timing_counter = c
-                    break
-            if timing_counter is not None:
-                results = session.controller.FetchCounters([timing_counter])
-                for r in results:
-                    counter_data[r.eventId] = r.value.d
-                has_real_timing = True
-        except Exception:
-            pass
-
+        counter_data, has_real_timing = _fetch_timing_data()
         sf = session.structured_file
 
-        if granularity == "draw_call":
-            entries: list[dict] = []
-            for eid in sorted(session.action_map.keys()):
-                action = session.action_map[eid]
-                if not (action.flags & rd.ActionFlags.Drawcall):
-                    continue
-                cost = counter_data.get(eid, action.numIndices / 3)  # heuristic: triangles
-                entries.append({
-                    "event_id": eid,
-                    "name": action.GetName(sf),
-                    "vertex_count": action.numIndices,
-                    "estimated_cost": round(cost, 4),
-                    "timing_unit": "ms" if has_real_timing else "triangles (heuristic)",
+        # Locate the starting action list
+        if parent_eid is not None:
+            parent_action = session.action_map.get(parent_eid)
+            if parent_action is None:
+                return to_json(make_error(
+                    f"Event ID {parent_eid} not found in action map", "NOT_FOUND"))
+            if not parent_action.children or len(parent_action.children) == 0:
+                # Leaf node — return its own data
+                own_ms = counter_data.get(parent_eid, 0.0)
+                flags_list = flags_to_list(parent_action.flags, {
+                    rd.ActionFlags.Drawcall: "Draw",
+                    rd.ActionFlags.Dispatch: "Dispatch",
+                    rd.ActionFlags.Clear: "Clear",
+                    rd.ActionFlags.Copy: "Copy",
+                    rd.ActionFlags.Resolve: "Resolve",
                 })
-            entries.sort(key=lambda e: -e["estimated_cost"])
-            return to_json({
-                "granularity": "draw_call",
-                "has_real_timing": has_real_timing,
-                "top_n": top_n,
-                "entries": entries[:top_n],
-                "total_draw_calls": len(entries),
-                "note": "" if has_real_timing else "GPU timing counters unavailable — showing triangle counts as proxy",
-            })
+                return to_json({
+                    "parent_eid": parent_eid,
+                    "parent_name": parent_action.GetName(sf),
+                    "is_leaf": True,
+                    "duration_ms": round(own_ms, 4),
+                    "flags": flags_list,
+                    "has_real_timing": has_real_timing,
+                    "note": "Leaf action — no children to drill into. Use get_draw_call_state for full details.",
+                })
+            action_list = parent_action.children
+            parent_total_ms = _sum_timing(parent_action, counter_data)
+            parent_name = parent_action.GetName(sf)
+        else:
+            action_list = session.controller.GetRootActions()
+            parent_total_ms = sum(_sum_timing(a, counter_data) for a in action_list)
+            parent_name = "Frame"
+            parent_eid = None
 
-        # Pass-level: group by consecutive render target set
-        passes: list[dict] = []
-        current: dict | None = None
-        last_outputs: tuple | None = None
+        def _build_node(action, depth: int, max_d: int) -> dict | None:
+            has_children = action.children and len(action.children) > 0
+            subtree_ms = _sum_timing(action, counter_data)
 
-        for eid in sorted(session.action_map.keys()):
-            action = session.action_map[eid]
-            is_clear = bool(action.flags & rd.ActionFlags.Clear)
-            is_draw = bool(action.flags & rd.ActionFlags.Drawcall)
-            if not is_clear and not is_draw:
-                continue
+            # Filter by min_ms (always show depth 0)
+            if depth > 0 and subtree_ms < min_ms:
+                return None
 
-            outputs = tuple(str(o) for o in action.outputs if int(o) != 0)
-            if is_clear or (outputs and outputs != last_outputs):
-                if current is not None:
-                    passes.append(current)
-                current = {
-                    "pass_index": len(passes),
-                    "start_event": eid,
-                    "end_event": eid,
-                    "name": action.GetName(sf),
-                    "draw_count": 0,
-                    "total_vertices": 0,
-                    "estimated_cost": 0.0,
-                    "render_targets": list(outputs),
-                }
-            if current is None:
-                current = {
-                    "pass_index": 0,
-                    "start_event": eid,
-                    "end_event": eid,
-                    "name": action.GetName(sf),
-                    "draw_count": 0,
-                    "total_vertices": 0,
-                    "estimated_cost": 0.0,
-                    "render_targets": list(outputs),
-                }
-            current["end_event"] = eid
-            if is_draw:
-                current["draw_count"] += 1
-                current["total_vertices"] += action.numIndices
-                cost = counter_data.get(eid, action.numIndices / 3)
-                current["estimated_cost"] += cost
-            if outputs:
-                last_outputs = outputs
+            name = action.GetName(sf)
+            draws, dispatches, leaf_count = _count_leaves(action)
 
-        if current is not None:
-            passes.append(current)
+            node: dict = {
+                "eid": action.eventId,
+                "name": name,
+                "duration_ms": round(subtree_ms, 4),
+            }
 
-        # Enrich with RT info
-        for p in passes:
-            rt_infos = []
-            for rid_str in p["render_targets"]:
-                td = session.get_texture_desc(rid_str)
-                if td:
-                    rt_infos.append(f"{td.width}x{td.height} {td.format.Name()}")
-            p["rt_summary"] = ", ".join(rt_infos) if rt_infos else "unknown"
-            p["estimated_cost"] = round(p["estimated_cost"], 4)
+            if has_children:
+                node["draws"] = draws
+                node["dispatches"] = dispatches
 
-        passes.sort(key=lambda p: -p["estimated_cost"])
-        return to_json({
-            "granularity": "pass",
+                if depth < max_d:
+                    # Expand children
+                    child_nodes = []
+                    for c in action.children:
+                        cn = _build_node(c, depth + 1, max_d)
+                        if cn is not None:
+                            child_nodes.append(cn)
+                    # Sort children by duration descending
+                    child_nodes.sort(key=lambda n: -n["duration_ms"])
+                    node["children"] = child_nodes
+                else:
+                    # Summarize: don't expand, indicate it can be drilled into
+                    node["children_count"] = len(action.children)
+                    node["hint"] = "call get_pass_timing(parent_eid={}) to expand".format(
+                        action.eventId)
+            else:
+                # Leaf node — add type flags
+                flags_list = []
+                if action.flags & rd.ActionFlags.Drawcall:
+                    flags_list.append("Draw")
+                if action.flags & rd.ActionFlags.Dispatch:
+                    flags_list.append("Dispatch")
+                if action.flags & rd.ActionFlags.Clear:
+                    flags_list.append("Clear")
+                if action.flags & rd.ActionFlags.Copy:
+                    flags_list.append("Copy")
+                if action.flags & rd.ActionFlags.Resolve:
+                    flags_list.append("Resolve")
+                if action.flags & rd.ActionFlags.PassBoundary:
+                    flags_list.append("PassBoundary")
+                if flags_list:
+                    node["flags"] = flags_list
+
+            return node
+
+        # Build the tree
+        children_nodes = []
+        for a in action_list:
+            node = _build_node(a, 0, max_depth)
+            if node is not None:
+                children_nodes.append(node)
+        children_nodes.sort(key=lambda n: -n["duration_ms"])
+
+        result: dict = {
             "has_real_timing": has_real_timing,
-            "top_n": top_n,
-            "passes": passes[:top_n],
-            "total_passes": len(passes),
-            "timing_unit": "ms" if has_real_timing else "triangles (heuristic)",
-            "note": "" if has_real_timing else "GPU timing counters unavailable — pass cost estimated from triangle counts",
-        })
+            "timing_unit": "ms",
+            "total_duration_ms": round(parent_total_ms, 4),
+            "parent_eid": parent_eid,
+            "parent_name": parent_name,
+            "max_depth": max_depth,
+            "children": children_nodes,
+        }
+        if not has_real_timing:
+            result["note"] = ("GPU timing counters unavailable — duration values "
+                              "are heuristic estimates based on triangle counts")
+        return to_json(result)
 
     @mcp.tool()
     def analyze_overdraw(

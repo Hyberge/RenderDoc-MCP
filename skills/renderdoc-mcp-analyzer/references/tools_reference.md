@@ -232,9 +232,12 @@
 ## Performance Tools (performance_tools.py)
 
 ### get_pass_timing
-- **参数**: `granularity="pass"/"draw_call"`, `top_n=20`
-- **功能**: 尝试 GPU 计数器获取真实时间，回退到三角形数量启发式估算
-- **RenderDoc API**: `controller.EnumerateCounters()`, `controller.FetchCounters()`
+- **参数**: `max_depth=2`, `parent_eid?`, `min_ms=0.0`
+- **功能**: 火焰图式层级耗时分析。沿 action 树返回 GPU Duration，支持逐层向下钻取
+- **工作流**: 先 `get_pass_timing()` 看总览 → 对最耗时节点调 `get_pass_timing(parent_eid=X)` 钻入 → 重复直至叶子 draw call
+- **GPU 计时**: 优先 `EnumerateCounters()` + `FetchCounters()` 获取真实 GPU Duration（单位：秒→自动转 ms），无 counter 时回退到三角形数量启发式估算
+- **层级感知**: 有 debug marker 的截帧（如 UE5）展示引擎渲染阶段层级；无 marker 的截帧展示为扁平列表
+- **RenderDoc API**: `controller.EnumerateCounters()`, `controller.FetchCounters()`, `controller.GetRootActions()` (action tree)
 
 ### analyze_overdraw
 - **参数**: `pass_name?`, `region?`, `sample_count=64`

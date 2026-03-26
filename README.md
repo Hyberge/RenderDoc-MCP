@@ -210,7 +210,8 @@ open_capture("frame.rdc")                     # 加载捕获文件
 性能与诊断分析：
 
 ```
-get_pass_timing(granularity="pass")      # 找出最耗时的渲染 Pass
+get_pass_timing()                         # 火焰图式层级耗时总览
+get_pass_timing(parent_eid=145)           # 钻入最耗时的节点
 analyze_overdraw()                        # Overdraw 估算
 analyze_bandwidth()                       # 显存带宽估算
 analyze_state_changes()                   # 合批优化机会
@@ -298,7 +299,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 
 | 工具 | 说明 |
 |------|------|
-| `get_pass_timing` | 最耗时的渲染 Pass（优先使用 GPU 计数器，回退为三角形数量估算） |
+| `get_pass_timing` | 火焰图式层级耗时分析（沿 action 树逐层钻取，优先使用 GPU 计数器） |
 | `analyze_overdraw` | 每个 RT 分组的 Overdraw 估算 |
 | `analyze_bandwidth` | 每个 RT 的读写带宽估算 |
 | `analyze_state_changes` | 查找冗余状态切换和合批优化机会 |

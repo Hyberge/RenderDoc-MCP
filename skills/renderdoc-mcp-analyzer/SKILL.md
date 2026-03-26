@@ -185,6 +185,7 @@ For detailed API reference, consult `references/renderdoc_api.md`. Key points:
 - Shader HLSL source available via `refl.debugInfo.files` when `shader_debug_paths` is set in `open_capture`
 - `GetDisassemblyTargets()` returns available targets; iterate and try each for best compatibility
 - GPU timing counters via `EnumerateCounters()`/`FetchCounters()` may not be available — fall back to heuristics
+- **GPU Duration counter returns seconds** (`CounterUnit.Seconds`), must multiply by 1000 to get ms! Counter data only exists for leaf actions; parent node timing must be computed by recursively summing children
 
 ### Common Debugging Workflows
 
@@ -209,10 +210,12 @@ get_api_calls_range(start, end) → scan raw API calls in EID range
 get_api_calls_range(start, end, name_filter="Barrier") → find specific API calls
 ```
 
-**Performance Analysis:**
+**Performance Analysis (flame-graph drill-down):**
 ```
 open_capture → get_frame_overview
-→ get_pass_timing (find expensive passes)
+→ get_pass_timing()                        — top-level overview (flame graph root)
+→ get_pass_timing(parent_eid=<expensive>)  — drill into hotspot
+→ repeat until leaf draw calls found
 → analyze_overdraw + analyze_bandwidth
 → analyze_state_changes (batching opportunities)
 → diagnose_mobile_risks (comprehensive check)
