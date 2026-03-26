@@ -21,6 +21,427 @@ from renderdoc_mcp.util import (
 )
 
 
+def _build_inst_info_lookup(trace) -> dict:
+    """Build a lookup from instruction index to InstructionSourceInfo.
+
+    instInfo is sorted by instruction but may be sparse. For a given instruction,
+    the correct entry is the lower bound (largest instruction <= target).
+    """
+    entries = []
+    try:
+        for info in trace.instInfo:
+            entries.append(info)
+    except Exception:
+        pass
+    return entries
+
+
+def _find_inst_info(entries: list, instruction: int):
+    """Binary search for the InstructionSourceInfo covering this instruction."""
+    if not entries:
+        return None
+    lo, hi = 0, len(entries) - 1
+    result = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if entries[mid].instruction <= instruction:
+            result = entries[mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return result
+
+
+def _build_source_var_map(trace) -> dict[str, str]:
+    """Build a global debug_var_name -> best_source_name mapping from trace.sourceVars.
+
+    trace.sourceVars contains mappings like:
+      name='TileCoord.x', variables=[DebugVariableReference(name='_238', component=0)]
+      name='View.View_TranslatedWorldToClip', variables=[DebugVariableReference(name='View[0]', component=0), ...]
+
+    We build a lookup: '_238' -> 'TileCoord', '_239' -> 'TileCoord' (strip .x/.y suffix for grouping).
+    """
+    mapping: dict[str, str] = {}
+    try:
+        for sv in trace.sourceVars:
+            src_name = sv.name
+            if not src_name:
+                continue
+            for dbg_ref in sv.variables:
+                if dbg_ref.name and dbg_ref.name not in mapping:
+                    mapping[dbg_ref.name] = src_name
+    except Exception:
+        pass
+    return mapping
+
+
+def _get_inst_source_var_map(inst_info) -> dict[str, str]:
+    """Build debug_var_name -> source_name mapping from per-instruction sourceVars.
+
+    Per-instruction sourceVars have higher priority (local variables like TileCoord.x).
+    """
+    mapping: dict[str, str] = {}
+    if inst_info is None:
+        return mapping
+    try:
+        for sv in inst_info.sourceVars:
+            src_name = sv.name
+            if not src_name:
+                continue
+            for dbg_ref in sv.variables:
+                if dbg_ref.name:
+                    mapping[dbg_ref.name] = src_name
+    except Exception:
+        pass
+    return mapping
+
+
+def _collect_all_states(session, trace) -> list:
+    """Run ContinueDebug to completion, return all ShaderDebugState objects."""
+    all_states: list = []
+    while True:
+        new_states = session.controller.ContinueDebug(trace.debugger)
+        if not new_states:
+            break
+        all_states.extend(new_states)
+    return all_states
+
+
+def _get_visible_source_vars(inst_info, inst_src_map: dict, global_src_map: dict) -> list[dict]:
+    """Get all visible source-level variables at an instruction, with their current values
+    resolved through the debug variable mapping."""
+    if inst_info is None:
+        return []
+    result: list[dict] = []
+    try:
+        for svm in inst_info.sourceVars:
+            if not svm.name or svm.undefinedValue:
+                continue
+            result.append({"name": svm.name, "rows": svm.rows, "columns": svm.columns})
+    except Exception:
+        pass
+    return result
+
+
+def _get_step_location(inst_info) -> dict | None:
+    """Extract source location from InstructionSourceInfo."""
+    if inst_info is None:
+        return None
+    try:
+        li = inst_info.lineInfo
+        if li.fileIndex >= 0 and li.lineStart > 0:
+            loc: dict = {"file_index": li.fileIndex, "line": li.lineStart}
+            if li.lineEnd != li.lineStart:
+                loc["line_end"] = li.lineEnd
+            return loc
+    except Exception:
+        pass
+    return None
+
+
+def _serialize_change(change, inst_src_map: dict, global_src_map: dict) -> dict | None:
+    """Serialize a ShaderVariableChange with source name mapping."""
+    var = change.after
+    if not var.name:
+        return None
+    dbg_name = var.name
+    source_name = inst_src_map.get(dbg_name) or global_src_map.get(dbg_name)
+    sv = serialize_shader_variable(var)
+    if source_name and source_name != dbg_name:
+        sv["source_name"] = source_name
+    # Anomaly detection
+    val = sv.get("value", [])
+    if isinstance(val, list):
+        flat = [v for v in val if isinstance(v, (int, float))]
+        display = source_name or dbg_name
+        if any(math.isnan(v) for v in flat):
+            sv["warning"] = f"⚠️ {display} contains NaN"
+        elif any(math.isinf(v) for v in flat):
+            sv["warning"] = f"⚠️ {display} contains Inf"
+    return sv
+
+
+def _run_shader_debug(
+    session,
+    trace,
+    mode: str = "summary",
+    watch_variables: list[str] | None = None,
+    run_to_step: int | None = None,
+    run_to_line: int | None = None,
+) -> dict:
+    """Execute shader debug trace with different analysis modes.
+
+    Modes:
+        summary: (default) Returns inputs, outputs, branch decisions, anomalies,
+                 and call chain. Compact and LLM-friendly.
+        watch:   Track specific source variables' value changes over execution.
+                 Requires watch_variables.
+        anomaly: Find the first step where NaN/Inf/negative appears,
+                 return context around it.
+        step:    Run to a specific step index (run_to_step) or source line
+                 (run_to_line), return all visible source variables at that point.
+    """
+    inst_entries = _build_inst_info_lookup(trace)
+    global_src_map = _build_source_var_map(trace)
+    all_states = _collect_all_states(session, trace)
+
+    if not all_states:
+        return {"error": "No debug states returned", "total_states": 0}
+
+    total_states = len(all_states)
+
+    # ── step mode: run to a specific step/line and dump visible variables ──
+    if mode == "step":
+        target_state = None
+        target_inst_info = None
+
+        if run_to_step is not None:
+            for st in all_states:
+                if st.stepIndex >= run_to_step:
+                    target_state = st
+                    break
+            if target_state is None:
+                target_state = all_states[-1]
+        elif run_to_line is not None:
+            # Try exact match first
+            for st in all_states:
+                info = _find_inst_info(inst_entries, st.nextInstruction)
+                if info and info.lineInfo.lineStart == run_to_line:
+                    target_state = st
+                    target_inst_info = info
+                    break
+            # If exact line not found, find the nearest reachable line after target
+            if target_state is None:
+                best_state = None
+                best_info = None
+                best_line = None
+                for st in all_states:
+                    info = _find_inst_info(inst_entries, st.nextInstruction)
+                    if info and info.lineInfo.lineStart > 0:
+                        line = info.lineInfo.lineStart
+                        if line >= run_to_line:
+                            if best_line is None or line < best_line:
+                                best_state = st
+                                best_info = info
+                                best_line = line
+                            if line == best_line:
+                                break  # found closest, stop
+                if best_state is not None:
+                    target_state = best_state
+                    target_inst_info = best_info
+                    # Will add a note about the line being optimized out
+            if target_state is None:
+                # Collect which lines were actually executed for diagnosis
+                executed_lines = sorted(set(
+                    info.lineInfo.lineStart
+                    for st in all_states
+                    for info in [_find_inst_info(inst_entries, st.nextInstruction)]
+                    if info and info.lineInfo.lineStart > 0
+                ))
+                nearby = [l for l in executed_lines if abs(l - run_to_line) <= 20]
+                return {
+                    "mode": "step",
+                    "error": f"Source line {run_to_line} not reached during execution (may be optimized out)",
+                    "total_states": total_states,
+                    "nearby_executed_lines": nearby or executed_lines[-10:],
+                    "hint": "Try one of the nearby_executed_lines instead",
+                }
+        else:
+            target_state = all_states[-1]
+
+        instruction = target_state.nextInstruction
+        if target_inst_info is None:
+            target_inst_info = _find_inst_info(inst_entries, instruction)
+        inst_src_map = _get_inst_source_var_map(target_inst_info)
+
+        visible_vars = _get_visible_source_vars(target_inst_info, inst_src_map, global_src_map)
+        location = _get_step_location(target_inst_info)
+
+        result_dict: dict = {
+            "mode": "step",
+            "total_states": total_states,
+            "stopped_at": {
+                "step": target_state.stepIndex,
+                "instruction": instruction,
+                "source_location": location,
+                "callstack": list(target_state.callstack) if target_state.callstack else [],
+            },
+            "visible_source_variables": visible_vars,
+        }
+        # Note if we had to snap to a different line
+        if run_to_line is not None and location and location.get("line") != run_to_line:
+            result_dict["note"] = (
+                f"Line {run_to_line} was optimized out by the compiler. "
+                f"Stopped at nearest reachable line {location.get('line')} instead."
+            )
+        return result_dict
+
+    # ── anomaly mode: find first NaN/Inf/negative ──
+    if mode == "anomaly":
+        for st in all_states:
+            instruction = st.nextInstruction
+            inst_info = _find_inst_info(inst_entries, instruction)
+            inst_src_map = _get_inst_source_var_map(inst_info)
+
+            for change in st.changes:
+                sv = _serialize_change(change, inst_src_map, global_src_map)
+                if sv and "warning" in sv:
+                    location = _get_step_location(inst_info)
+                    # Collect context: a few steps before and after
+                    step_idx = st.stepIndex
+                    context_steps: list[dict] = []
+                    for ctx_st in all_states:
+                        if abs(ctx_st.stepIndex - step_idx) <= 3:
+                            ctx_info = _find_inst_info(inst_entries, ctx_st.nextInstruction)
+                            ctx_src_map = _get_inst_source_var_map(ctx_info)
+                            ctx_changes = []
+                            for c in ctx_st.changes:
+                                s = _serialize_change(c, ctx_src_map, global_src_map)
+                                if s:
+                                    ctx_changes.append(s)
+                            if ctx_changes:
+                                context_steps.append({
+                                    "step": ctx_st.stepIndex,
+                                    "source_location": _get_step_location(ctx_info),
+                                    "variables": ctx_changes,
+                                })
+                    return {
+                        "mode": "anomaly",
+                        "total_states": total_states,
+                        "anomaly_found": True,
+                        "first_anomaly": {
+                            "step": step_idx,
+                            "instruction": instruction,
+                            "source_location": location,
+                            "variable": sv,
+                            "callstack": list(st.callstack) if st.callstack else [],
+                        },
+                        "context": context_steps,
+                    }
+
+        return {
+            "mode": "anomaly",
+            "total_states": total_states,
+            "anomaly_found": False,
+            "message": "No NaN/Inf values detected during shader execution",
+        }
+
+    # ── watch mode: track specific variables ──
+    if mode == "watch":
+        if not watch_variables:
+            return {"error": "watch mode requires watch_variables parameter"}
+
+        watch_lower = [w.lower() for w in watch_variables]
+        history: dict[str, list[dict]] = {}  # var_name -> list of {step, value, ...}
+
+        for st in all_states:
+            instruction = st.nextInstruction
+            inst_info = _find_inst_info(inst_entries, instruction)
+            inst_src_map = _get_inst_source_var_map(inst_info)
+
+            # Check source vars visible at this step
+            if inst_info:
+                for svm in inst_info.sourceVars:
+                    if not svm.name or svm.undefinedValue:
+                        continue
+                    if not any(w in svm.name.lower() for w in watch_lower):
+                        continue
+                    # Check if any of this source var's debug refs changed
+                    dbg_refs = set()
+                    for r in svm.variables:
+                        if r.name:
+                            dbg_refs.add(r.name)
+                    for change in st.changes:
+                        if change.after.name in dbg_refs:
+                            sv = _serialize_change(change, inst_src_map, global_src_map)
+                            if sv:
+                                key = svm.name
+                                if key not in history:
+                                    history[key] = []
+                                location = _get_step_location(inst_info)
+                                history[key].append({
+                                    "step": st.stepIndex,
+                                    "source_location": location,
+                                    "value": sv.get("value"),
+                                    **({"warning": sv["warning"]} if "warning" in sv else {}),
+                                })
+                                break
+
+        return {
+            "mode": "watch",
+            "total_states": total_states,
+            "watched_variables": {k: v for k, v in history.items()},
+            "variables_found": len(history),
+        }
+
+    # ── summary mode (default): compact overview ──
+    # Collect: inputs, outputs, unique callstack functions, anomalies, branch count
+    inputs: list[dict] = []
+    try:
+        for inp in trace.inputs:
+            if inp.name:
+                inputs.append(serialize_shader_variable(inp))
+    except Exception:
+        pass
+
+    # Get final state's visible source vars as "outputs"
+    last_state = all_states[-1]
+    last_inst_info = _find_inst_info(inst_entries, last_state.nextInstruction)
+    last_src_map = _get_inst_source_var_map(last_inst_info)
+    final_visible = _get_visible_source_vars(last_inst_info, last_src_map, global_src_map)
+
+    # Unique functions in callstack
+    all_functions: list[str] = []
+    seen_funcs: set[str] = set()
+    for st in all_states:
+        if st.callstack:
+            for fn in st.callstack:
+                if fn not in seen_funcs:
+                    seen_funcs.add(fn)
+                    all_functions.append(fn)
+
+    # Find anomalies
+    anomalies: list[dict] = []
+    for st in all_states:
+        inst_info = _find_inst_info(inst_entries, st.nextInstruction)
+        inst_src_map = _get_inst_source_var_map(inst_info)
+        for change in st.changes:
+            sv = _serialize_change(change, inst_src_map, global_src_map)
+            if sv and "warning" in sv:
+                anomalies.append({
+                    "step": st.stepIndex,
+                    "source_location": _get_step_location(inst_info),
+                    "variable": sv,
+                })
+                if len(anomalies) >= 10:
+                    break
+        if len(anomalies) >= 10:
+            break
+
+    # Unique source lines executed (for branch analysis)
+    executed_lines: set[int] = set()
+    for st in all_states:
+        inst_info = _find_inst_info(inst_entries, st.nextInstruction)
+        if inst_info and inst_info.lineInfo.lineStart > 0:
+            executed_lines.add(inst_info.lineInfo.lineStart)
+
+    result: dict = {
+        "mode": "summary",
+        "total_states": total_states,
+        "unique_source_lines_executed": len(executed_lines),
+        "functions_called": all_functions,
+        "inputs": inputs[:20],
+        "final_visible_variables": final_visible[:30],
+    }
+    if anomalies:
+        result["anomalies"] = anomalies
+        result["anomaly_count"] = len(anomalies)
+    else:
+        result["anomalies"] = []
+
+    return result
+
+
 def register(mcp: FastMCP):
 
     @mcp.tool()
@@ -196,25 +617,26 @@ def register(mcp: FastMCP):
         pixel_x: int,
         pixel_y: int,
         stage: str = "pixel",
+        mode: str = "summary",
         watch_variables: Optional[list[str]] = None,
+        run_to_step: Optional[int] = None,
+        run_to_line: Optional[int] = None,
     ) -> str:
         """Debug the shader at a specific pixel using RenderDoc's shader debugger.
-
-        Executes the shader for the given pixel and returns intermediate variable
-        values at each step. Useful for tracing negative values, IBL computation
-        errors, TAA artifacts, and other precision issues.
-
-        Note: Shader debugging may not be supported for all API/GPU combinations.
-        If unsupported, falls back to reporting pixel value and bound shader info.
 
         Args:
             event_id: The event ID of the draw call.
             pixel_x: X coordinate (render target space, origin top-left).
             pixel_y: Y coordinate.
             stage: Shader stage to debug: "pixel" (default) or "vertex".
-            watch_variables: Optional list of variable names to focus on
-                             (e.g. ["color", "iblDiffuse", "exposure"]).
-                             If omitted, all variables are returned (may be large).
+            mode: Debug analysis mode:
+                  "summary" (default) - compact overview: inputs, outputs, anomalies, call chain.
+                  "watch" - track specific variables (requires watch_variables).
+                  "anomaly" - find first NaN/Inf and return context around it.
+                  "step" - run to specific step/line, show all visible variables.
+            watch_variables: Variable names to track (for "watch" mode, also filters other modes).
+            run_to_step: Stop at this step index (for "step" mode).
+            run_to_line: Stop at this source line number (for "step" mode).
         """
         session = get_session()
         err = session.require_open()
@@ -269,53 +691,30 @@ def register(mcp: FastMCP):
         debug_error: str | None = None
         try:
             if stage_enum == rd.ShaderStage.Pixel:
-                shader_debug = session.controller.DebugPixel(
+                trace = session.controller.DebugPixel(
                     pixel_x, pixel_y,
                     rd.DebugPixelInputs(),
                 )
             else:
-                shader_debug = None
+                trace = None
 
-            if shader_debug is not None and hasattr(shader_debug, "states") and shader_debug.states:
-                states = shader_debug.states
-                steps: list[dict] = []
-
-                for step_state in states:
-                    step: dict = {}
-                    # Try to get changed variables at this step
+            if trace is not None and trace.debugger is not None:
+                trace_result = _run_shader_debug(
+                    session, trace, mode=mode,
+                    watch_variables=watch_variables,
+                    run_to_step=run_to_step, run_to_line=run_to_line,
+                )
+                try:
+                    session.controller.FreeTrace(trace)
+                except Exception:
+                    pass
+            else:
+                debug_error = "DebugPixel returned no debugger (may not be supported for this API/GPU)"
+                if trace is not None:
                     try:
-                        changed = []
-                        if hasattr(step_state, "locals"):
-                            for var in step_state.locals:
-                                vname = var.name
-                                if watch_variables and not any(w.lower() in vname.lower() for w in watch_variables):
-                                    continue
-                                sv = serialize_shader_variable(var)
-                                # Annotate anomalies
-                                val = sv.get("value", [])
-                                if isinstance(val, list):
-                                    flat = [v for v in val if isinstance(v, (int, float))]
-                                    if any(math.isnan(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} 包含 NaN"
-                                    elif any(math.isinf(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} 包含 Inf"
-                                    elif any(v < 0 for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} 包含负值: {flat}"
-                                changed.append(sv)
-                        if changed:
-                            step["variables"] = changed
+                        session.controller.FreeTrace(trace)
                     except Exception:
                         pass
-
-                    if step:
-                        steps.append(step)
-
-                trace_result = {
-                    "steps_with_changes": len(steps),
-                    "trace": steps[:200],  # cap output
-                }
-            else:
-                debug_error = "DebugPixel returned no trace data (may not be supported for this API/GPU)"
         except Exception as e:
             debug_error = f"Shader debugging failed: {type(e).__name__}: {e}"
 
@@ -347,15 +746,12 @@ def register(mcp: FastMCP):
         instance_id: int = 0,
         index: int = 0,
         view: int = 0,
+        mode: str = "summary",
         watch_variables: Optional[list[str]] = None,
+        run_to_step: Optional[int] = None,
+        run_to_line: Optional[int] = None,
     ) -> str:
         """Debug the vertex shader at a specific vertex using RenderDoc's shader debugger.
-
-        Executes the vertex shader for the given vertex and returns intermediate variable
-        values at each step. Useful for tracing vertex transform issues, skinning bugs,
-        or incorrect vertex attribute reads.
-
-        Note: Shader debugging may not be supported for all API/GPU combinations.
 
         Args:
             event_id: The event ID of the draw call.
@@ -363,8 +759,14 @@ def register(mcp: FastMCP):
             instance_id: Instance ID (default 0).
             index: Index value (default 0).
             view: Multiview index (default 0).
-            watch_variables: Optional list of variable names to focus on.
-                             If omitted, all variables are returned (may be large).
+            mode: Debug analysis mode:
+                  "summary" (default) - compact overview: inputs, outputs, anomalies, call chain.
+                  "watch" - track specific variables (requires watch_variables).
+                  "anomaly" - find first NaN/Inf and return context around it.
+                  "step" - run to specific step/line, show all visible variables.
+            watch_variables: Variable names to track (for "watch" mode, also filters other modes).
+            run_to_step: Stop at this step index (for "step" mode).
+            run_to_line: Stop at this source line number (for "step" mode).
         """
         session = get_session()
         err = session.require_open()
@@ -392,43 +794,25 @@ def register(mcp: FastMCP):
         trace_result: dict | None = None
         debug_error: str | None = None
         try:
-            shader_debug = session.controller.DebugVertex(vertex_id, instance_id, index, view)
+            trace = session.controller.DebugVertex(vertex_id, instance_id, index, view)
 
-            if shader_debug is not None and hasattr(shader_debug, "states") and shader_debug.states:
-                states = shader_debug.states
-                steps: list[dict] = []
-
-                for step_state in states:
-                    step: dict = {}
+            if trace is not None and trace.debugger is not None:
+                trace_result = _run_shader_debug(
+                    session, trace, mode=mode,
+                    watch_variables=watch_variables,
+                    run_to_step=run_to_step, run_to_line=run_to_line,
+                )
+                try:
+                    session.controller.FreeTrace(trace)
+                except Exception:
+                    pass
+            else:
+                debug_error = "DebugVertex returned no debugger (may not be supported for this API/GPU)"
+                if trace is not None:
                     try:
-                        changed = []
-                        if hasattr(step_state, "locals"):
-                            for var in step_state.locals:
-                                vname = var.name
-                                if watch_variables and not any(w.lower() in vname.lower() for w in watch_variables):
-                                    continue
-                                sv = serialize_shader_variable(var)
-                                val = sv.get("value", [])
-                                if isinstance(val, list):
-                                    flat = [v for v in val if isinstance(v, (int, float))]
-                                    if any(math.isnan(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} contains NaN"
-                                    elif any(math.isinf(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} contains Inf"
-                                changed.append(sv)
-                        if changed:
-                            step["variables"] = changed
+                        session.controller.FreeTrace(trace)
                     except Exception:
                         pass
-                    if step:
-                        steps.append(step)
-
-                trace_result = {
-                    "steps_with_changes": len(steps),
-                    "trace": steps[:200],
-                }
-            else:
-                debug_error = "DebugVertex returned no trace data (may not be supported for this API/GPU)"
         except Exception as e:
             debug_error = f"Vertex shader debugging failed: {type(e).__name__}: {e}"
 
@@ -449,20 +833,25 @@ def register(mcp: FastMCP):
         event_id: int,
         group_id: Optional[list[int]] = None,
         thread_id: Optional[list[int]] = None,
+        mode: str = "summary",
         watch_variables: Optional[list[str]] = None,
+        run_to_step: Optional[int] = None,
+        run_to_line: Optional[int] = None,
     ) -> str:
         """Debug a compute shader thread using RenderDoc's shader debugger.
-
-        Executes the compute shader for the given group and thread IDs, returning
-        intermediate variable values. Useful for tracing compute dispatch issues.
-
-        Note: Shader debugging may not be supported for all API/GPU combinations.
 
         Args:
             event_id: The event ID of the dispatch call.
             group_id: Work group ID as [x, y, z] (default [0, 0, 0]).
             thread_id: Thread ID within the group as [x, y, z] (default [0, 0, 0]).
-            watch_variables: Optional list of variable names to focus on.
+            mode: Debug analysis mode:
+                  "summary" (default) - compact overview: inputs, outputs, anomalies, call chain.
+                  "watch" - track specific variables (requires watch_variables).
+                  "anomaly" - find first NaN/Inf and return context around it.
+                  "step" - run to specific step/line, show all visible variables.
+            watch_variables: Variable names to track (for "watch" mode, also filters other modes).
+            run_to_step: Stop at this step index (for "step" mode).
+            run_to_line: Stop at this source line number (for "step" mode).
         """
         session = get_session()
         err = session.require_open()
@@ -495,43 +884,25 @@ def register(mcp: FastMCP):
         trace_result: dict | None = None
         debug_error: str | None = None
         try:
-            shader_debug = session.controller.DebugThread(tuple(gid), tuple(tid))
+            trace = session.controller.DebugThread(tuple(gid), tuple(tid))
 
-            if shader_debug is not None and hasattr(shader_debug, "states") and shader_debug.states:
-                states = shader_debug.states
-                steps: list[dict] = []
-
-                for step_state in states:
-                    step: dict = {}
+            if trace is not None and trace.debugger is not None:
+                trace_result = _run_shader_debug(
+                    session, trace, mode=mode,
+                    watch_variables=watch_variables,
+                    run_to_step=run_to_step, run_to_line=run_to_line,
+                )
+                try:
+                    session.controller.FreeTrace(trace)
+                except Exception:
+                    pass
+            else:
+                debug_error = "DebugThread returned no debugger (may not be supported for this API/GPU)"
+                if trace is not None:
                     try:
-                        changed = []
-                        if hasattr(step_state, "locals"):
-                            for var in step_state.locals:
-                                vname = var.name
-                                if watch_variables and not any(w.lower() in vname.lower() for w in watch_variables):
-                                    continue
-                                sv = serialize_shader_variable(var)
-                                val = sv.get("value", [])
-                                if isinstance(val, list):
-                                    flat = [v for v in val if isinstance(v, (int, float))]
-                                    if any(math.isnan(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} contains NaN"
-                                    elif any(math.isinf(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} contains Inf"
-                                changed.append(sv)
-                        if changed:
-                            step["variables"] = changed
+                        session.controller.FreeTrace(trace)
                     except Exception:
                         pass
-                    if step:
-                        steps.append(step)
-
-                trace_result = {
-                    "steps_with_changes": len(steps),
-                    "trace": steps[:200],
-                }
-            else:
-                debug_error = "DebugThread returned no trace data (may not be supported for this API/GPU)"
         except Exception as e:
             debug_error = f"Compute shader debugging failed: {type(e).__name__}: {e}"
 

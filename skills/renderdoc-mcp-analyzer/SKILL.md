@@ -108,6 +108,37 @@ For depth/rasterizer state, use `_get_depth_state(state)` and `_get_rasterizer_s
 - `FrameStatistics.recorded` is only `True` for D3D11 captures; D3D12/Vulkan/GL don't collect frame statistics
 - SWIG sub-objects (e.g. `DrawcallStats`, `DispatchStats`) are not JSON-serializable — extract their numeric attributes manually
 - `GetCBufferVariableContents()` requires correct `byteOffset` and `byteSize` from `cb_bind.descriptor.byteOffset/byteSize`. Passing `0, 0` causes all-zero reads on D3D12 because cbuffers are typically bound at non-zero offsets within a large buffer (via Root CBV / Descriptor Table). This matches RenderDoc GUI behavior in `BufferViewer.cpp:3745`
+- **Shader debugging** (`DebugPixel`/`DebugVertex`/`DebugThread`):
+  - Returns a `ShaderDebugTrace` with `.debugger` handle — NOT pre-populated states
+  - Must call `controller.ContinueDebug(trace.debugger)` in a loop to collect `ShaderDebugState` objects; returns empty list when done
+  - Each `ShaderDebugState` has `.changes` (list of `ShaderVariableChange`), NOT `.locals` or `.states`
+  - `ShaderVariableChange.after` gives the `ShaderVariable` with new value
+  - Must call `controller.FreeTrace(trace)` when done to release debugger resources
+  - Source variable mapping: `trace.sourceVars` (global) and `trace.instInfo[].sourceVars` (per-instruction) map debug register names to HLSL variable names
+  - `trace.instInfo` entries have `.lineInfo` (fileIndex, lineStart, lineEnd) for source location mapping
+  - Lines may be optimized out by the compiler — use nearest reachable line fallback
+- **Disassemble shader with HLSL**: `refl.debugInfo.files` contains HLSL source when shader PDB is loaded via `shader_debug_paths`. Check `len(debug_info.files) > 0` and use `f.contents` for source text
+- **Shader debug paths**: Must be set via `rd.SetConfigSetting("DXBC.Debug.SearchDirPaths")` **before** `cap.OpenCapture()` because `DXBCContainer` loads debug info during construction
+
+### Verification Rule (MUST follow)
+
+After modifying MCP server code, **do NOT ask the user to restart the MCP server for verification**. Instead, generate a standalone Python verification script that directly imports and calls the modified code. The script should:
+
+1. Set `RENDERDOC_MODULE_PATH` environment variable and import `renderdoc` module
+2. Reproduce the scenario that exercises the changed code path
+3. Print clear PASS/FAIL results
+4. Be runnable with `python verify_xxx.py` without any MCP server running
+
+Example pattern:
+```python
+import os, sys
+os.environ["RENDERDOC_MODULE_PATH"] = "D:/renderdoc-mcp/build/x64"
+sys.path.insert(0, "D:/renderdoc-mcp/mcpserver/src")
+import renderdoc as rd
+# ... direct API calls to verify the fix ...
+```
+
+This avoids the slow MCP restart cycle and gives immediate feedback. Clean up the script after verification succeeds.
 
 
 ### Session Lifecycle
@@ -150,7 +181,8 @@ For detailed API reference, consult `references/renderdoc_api.md`. Key points:
 
 - `controller.GetPipelineState()` returns a generic `PipeState` object — it does NOT have `GetViewports()`, `GetDepthState()`, or `GetRasterizer()` methods (see PipeState API Pitfalls above)
 - Pixel operations need `rd.Subresource(mip, slice, 0)` and `rd.CompType.Typeless`
-- Shader debugging via `controller.DebugPixel()` may not work on all API/GPU combinations — always implement fallback
+- Shader debugging via `controller.DebugPixel()` returns a `ShaderDebugTrace` — must call `ContinueDebug(trace.debugger)` in a loop to get states, then `FreeTrace(trace)` to release. May not work on all API/GPU combinations — always implement fallback
+- Shader HLSL source available via `refl.debugInfo.files` when `shader_debug_paths` is set in `open_capture`
 - `GetDisassemblyTargets()` returns available targets; iterate and try each for best compatibility
 - GPU timing counters via `EnumerateCounters()`/`FetchCounters()` may not be available — fall back to heuristics
 
@@ -158,14 +190,16 @@ For detailed API reference, consult `references/renderdoc_api.md`. Key points:
 
 **Render Bug Investigation:**
 ```
-open_capture → get_capture_info (GPU quirks)
+open_capture(shader_debug_paths=[...]) → get_capture_info (GPU quirks)
 → list_actions (filter relevant pass)
 → get_draw_call_state (one-shot overview)
 → get_pipeline_state + get_shader_bindings (deep dive)
 → get_api_calls_by_action (raw API calls with params)
 → sample_pixel_region (scan for anomalies)
 → pixel_history (trace specific pixel)
-→ debug_shader_at_pixel (step through shader)
+→ debug_shader_at_pixel(mode="anomaly") (find first NaN/Inf)
+→ debug_shader_at_pixel(mode="step", run_to_line=N) (inspect variables at source line)
+→ disassemble_shader(target="hlsl") (view HLSL source if PDB available)
 ```
 
 **API Call Investigation:**
@@ -190,7 +224,8 @@ diagnose_negative_values (auto-scan all float RTs)
 → First introduced at event X → set_event(X)
 → get_shader_bindings + get_cbuffer_contents (check IBL/SH params)
 → disassemble_shader(search="SampleSH") (find problematic code)
-→ debug_shader_at_pixel on anomalous pixel
+→ debug_shader_at_pixel(mode="anomaly") on anomalous pixel (find NaN/Inf source)
+→ debug_shader_at_pixel(mode="watch", watch_variables=["color", "iblDiffuse"]) (track specific vars)
 ```
 
 ## Reference Documents

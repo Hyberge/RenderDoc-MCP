@@ -154,11 +154,44 @@ history = controller.PixelHistory(                   # 获取像素修改历史
 # mod.eventId, mod.Passed(), mod.preMod, mod.postMod
 # mod.backfaceCulled, mod.depthTestFailed, mod.stencilTestFailed, etc.
 
-shaderDebug = controller.DebugPixel(                 # 像素 shader 调试
+trace = controller.DebugPixel(                       # 像素 shader 调试
     x, y, rd.DebugPixelInputs()
 )
-# shaderDebug.states → [ShaderDebugState, ...]
-# state.locals → [ShaderVariable, ...]
+# trace → ShaderDebugTrace
+# trace.debugger → debugger handle (NOT pre-populated states!)
+# trace.inputs → [ShaderVariable, ...] (shader inputs)
+# trace.sourceVars → global source variable mappings
+# trace.instInfo → [InstructionSourceInfo, ...] (per-instruction metadata)
+#   instInfo[].instruction → instruction index
+#   instInfo[].lineInfo → LineColumnInfo (.fileIndex, .lineStart, .lineEnd)
+#   instInfo[].sourceVars → per-instruction source variable mappings
+
+# ⚠️ 必须通过 ContinueDebug 循环获取执行状态：
+all_states = []
+while True:
+    new_states = controller.ContinueDebug(trace.debugger)
+    if not new_states:
+        break
+    all_states.extend(new_states)
+# all_states → [ShaderDebugState, ...]
+# state.stepIndex → 执行步骤索引
+# state.nextInstruction → 下一条指令索引
+# state.callstack → 调用栈
+# state.changes → [ShaderVariableChange, ...]  (⚠️ 不是 .locals 或 .states!)
+#   change.after → ShaderVariable (变更后的值)
+
+# ⚠️ 用完必须释放调试器资源：
+controller.FreeTrace(trace)
+
+# Source variable mapping:
+# trace.sourceVars (全局) 和 instInfo[].sourceVars (per-instruction)
+# 包含 SourceVariableMapping 对象:
+#   svm.name → HLSL 源码变量名 (如 "TileCoord.x")
+#   svm.variables → [DebugVariableReference, ...]
+#     ref.name → 调试寄存器名 (如 "_238")
+#     ref.component → 分量索引
+#   svm.rows, svm.columns → 变量维度
+#   svm.undefinedValue → 值是否未定义
 ```
 
 ### 性能计数器
@@ -227,15 +260,28 @@ histogram = controller.GetHistogram(                 # 获取纹理直方图
 # 返回 256 个 int 值的列表，每个代表一个亮度 bucket 的像素数
 ```
 
-### 顶点/Compute 调试（新增工具使用）
+### 顶点/Compute 调试
 ```python
-shaderDebug = controller.DebugVertex(                # 顶点着色器调试
+trace = controller.DebugVertex(                      # 顶点着色器调试
     vertid, instid, idx, view
 )
-shaderDebug = controller.DebugThread(                # Compute shader 线程调试
+trace = controller.DebugThread(                      # Compute shader 线程调试
     (gx, gy, gz), (tx, ty, tz)
 )
 # 返回与 DebugPixel 相同的 ShaderDebugTrace 结构
+# 同样需要 ContinueDebug 循环获取状态，用完调用 FreeTrace 释放
+```
+
+### Shader Debug Info (HLSL 源码)
+```python
+refl = state.GetShaderReflection(stage)
+debug_info = refl.debugInfo
+# debug_info.files → shader 源码文件列表
+#   file.filename → 文件名
+#   file.contents → 源码内容 (HLSL)
+# 需要通过 open_capture 的 shader_debug_paths 参数设置 PDB 搜索路径
+# 底层调用: rd.SetConfigSetting("DXBC.Debug.SearchDirPaths")
+# ⚠️ 必须在 cap.OpenCapture() 之前设置，因为 DXBCContainer 在构造时加载 debug info
 ```
 
 ## 关键数据结构

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -47,7 +48,10 @@ def _get_gpu_quirks(driver_name: str) -> list[str]:
 
 def register(mcp: FastMCP):
     @mcp.tool()
-    def open_capture(filepath: str) -> str:
+    def open_capture(
+        filepath: str,
+        shader_debug_paths: Optional[list[str]] = None,
+    ) -> str:
         """Open a RenderDoc capture (.rdc) file for analysis.
 
         Automatically closes any previously opened capture.
@@ -55,10 +59,15 @@ def register(mcp: FastMCP):
 
         Args:
             filepath: Absolute path to the .rdc capture file.
+            shader_debug_paths: Optional list of directories to search for
+                separate shader debug info (PDB files). This enables HLSL
+                source-level view in disassemble_shader, matching RenderDoc
+                GUI's "Shader debug info search paths" setting.
+                Example: ["E:/Project/Saved/ShaderSymbols"]
         """
         filepath = os.path.normpath(filepath)
         session = get_session()
-        result = session.open(filepath)
+        result = session.open(filepath, shader_debug_paths=shader_debug_paths)
         return to_json(result)
 
     @mcp.tool()

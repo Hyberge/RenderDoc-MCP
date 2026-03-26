@@ -69,8 +69,16 @@ class RenderDocSession:
             return make_error("No capture file is open. Use open_capture first.", "NO_CAPTURE_OPEN")
         return None
 
-    def open(self, filepath: str) -> dict:
-        """Open a .rdc capture file. Closes any previously open capture."""
+    def open(self, filepath: str, shader_debug_paths: list[str] | None = None) -> dict:
+        """Open a .rdc capture file. Closes any previously open capture.
+
+        Args:
+            filepath: Absolute path to the .rdc file.
+            shader_debug_paths: Optional list of directories to search for
+                separate shader debug info (PDB files). Must be set before
+                opening the capture. Matches RenderDoc GUI's
+                "Shader debug info search paths" setting.
+        """
         self._ensure_initialized()
 
         if not os.path.isfile(filepath):
@@ -79,6 +87,12 @@ class RenderDocSession:
         # Close any existing capture
         if self.is_open:
             self.close()
+
+        # Set shader debug info search paths before opening capture.
+        # This must happen before OpenCapture() because DXBCContainer loads
+        # debug info during construction (TryFetchSeparateDebugInfo).
+        if shader_debug_paths:
+            self._set_shader_debug_paths(shader_debug_paths)
 
         cap = rd.OpenCaptureFile()
         result = cap.OpenFile(filepath, "", None)
@@ -129,7 +143,7 @@ class RenderDocSession:
         # Gather summary
         root_actions = controller.GetRootActions()
 
-        return {
+        result_info = {
             "filepath": filepath,
             "api": cap.DriverName(),
             "total_actions": len(self._action_map),
@@ -137,6 +151,10 @@ class RenderDocSession:
             "textures": len(textures),
             "buffers": len(buffers),
         }
+        if shader_debug_paths:
+            result_info["shader_debug_paths"] = shader_debug_paths
+
+        return result_info
 
     def _build_action_map(self, actions):
         """Recursively index all actions by event_id."""
@@ -154,6 +172,24 @@ class RenderDocSession:
                     self._event_map[evt.eventId] = evt.chunkIndex
             if len(a.children) > 0:
                 self._build_event_map(a.children)
+
+    def _set_shader_debug_paths(self, paths: list[str]):
+        """Configure shader debug info search paths via RenderDoc config system.
+
+        This sets the DXBC.Debug.SearchDirPaths config, matching RenderDoc GUI's
+        "Shader debug info search paths" dialog (SettingsDialog.cpp:673).
+        All paths are added as recursive search paths.
+        """
+        try:
+            paths_obj = rd.SetConfigSetting("DXBC.Debug.SearchDirPaths")
+            if paths_obj is not None:
+                paths_obj.DeleteChildren()
+                for p in paths:
+                    child = rd.makeSDString("$el", p)
+                    paths_obj.AddChild(child)
+        except Exception:
+            # If SetConfigSetting is not available in this build, silently skip
+            pass
 
     def resolve_resource_id(self, resource_id_str: str):
         """Resolve a resource ID string to a ResourceId object, or None."""

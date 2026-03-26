@@ -20,10 +20,11 @@
 ## Session Management (session_tools.py)
 
 ### open_capture
-- **参数**: `filepath: str` — .rdc 文件绝对路径
-- **功能**: 打开捕获文件，自动关闭之前的捕获。构建 action_map、event_map 和资源缓存
-- **返回**: filepath, api, total_actions, root_actions, textures, buffers 数量
-- **RenderDoc API**: `rd.OpenCaptureFile()` → `cap.OpenFile()` → `cap.OpenCapture()`
+- **参数**: `filepath: str` — .rdc 文件绝对路径; `shader_debug_paths: Optional[list[str]]` — shader PDB 搜索路径列表
+- **功能**: 打开捕获文件，自动关闭之前的捕获。构建 action_map、event_map 和资源缓存。若提供 `shader_debug_paths`，在打开前配置 `DXBC.Debug.SearchDirPaths`，使 disassemble_shader 可返回 HLSL 源码
+- **超时**: 60s（默认 10s 的特殊覆盖，因大截帧含 shader PDB 扫描耗时较长）
+- **返回**: filepath, api, total_actions, root_actions, textures, buffers 数量, shader_debug_paths（若设置）
+- **RenderDoc API**: `rd.OpenCaptureFile()` → `cap.OpenFile()` → `cap.OpenCapture()`; `rd.SetConfigSetting("DXBC.Debug.SearchDirPaths")` 设置 PDB 路径
 
 ### close_capture
 - **参数**: 无
@@ -173,7 +174,8 @@
 
 ### disassemble_shader
 - **参数**: `stage`, `target?`, `event_id?`, `line_range?`, `search?`
-- **功能**: 反汇编 shader，支持自动回退链（尝试所有目标）、行范围过滤、关键字搜索（带 5 行上下文）
+- **功能**: 反汇编 shader。若 target 省略且有 HLSL 源码（通过 shader PDB），自动返回 HLSL 源码；`target="hlsl"` 强制请求源码。支持自动回退链（尝试所有目标）、行范围过滤、关键字搜索（带 5 行上下文）
+- **HLSL 源码**: 通过 `refl.debugInfo.files` 检测，需在 `open_capture` 时设置 `shader_debug_paths`
 - **回退**: 所有反汇编失败时返回 reflection 信息
 
 ### get_shader_reflection
@@ -197,10 +199,15 @@
 - **限制**: 最大 1024 采样点
 
 ### debug_shader_at_pixel
-- **参数**: `event_id`, `pixel_x`, `pixel_y`, `stage="pixel"`, `watch_variables?`
-- **功能**: 在指定像素执行 shader 调试，返回中间变量值（含异常标注）
+- **参数**: `event_id`, `pixel_x`, `pixel_y`, `stage="pixel"`, `mode="summary"`, `watch_variables?`, `run_to_step?`, `run_to_line?`
+- **功能**: 在指定像素执行 shader 调试，支持 4 种模式：
+  - `summary`（默认）: 紧凑概览——inputs/outputs/anomalies/call chain
+  - `watch`: 追踪指定变量的值变化历史
+  - `anomaly`: 定位第一个 NaN/Inf 出现的步骤和上下文
+  - `step`: 运行到指定步骤/源码行，显示所有可见源码变量
+- **run_to_line 容错**: 若目标行被编译器优化掉，自动 snap 到最近可达行；若无可达行，返回 nearby_executed_lines 提示
 - **回退**: 调试不支持时返回像素值 + shader 信息 + 建议
-- **RenderDoc API**: `controller.DebugPixel(x, y, DebugPixelInputs())`
+- **RenderDoc API**: `controller.DebugPixel(x, y, DebugPixelInputs())` → `ContinueDebug(trace.debugger)` 循环 → `FreeTrace(trace)`
 
 ### pixel_history
 - **参数**: `resource_id`, `x`, `y`, `event_id?`
@@ -324,16 +331,16 @@
 ## Advanced Tools 新增工具
 
 ### debug_vertex
-- **参数**: `event_id`, `vertex_id`, `instance_id=0`, `index=0`, `view=0`, `watch_variables?`
-- **功能**: 顶点着色器调试——逐步追踪顶点变换变量，标注 NaN/Inf 异常
+- **参数**: `event_id`, `vertex_id`, `instance_id=0`, `index=0`, `view=0`, `mode="summary"`, `watch_variables?`, `run_to_step?`, `run_to_line?`
+- **功能**: 顶点着色器调试，支持与 `debug_shader_at_pixel` 相同的 4 种模式（summary/watch/anomaly/step）
 - **回退**: 调试不支持时返回 input/output signature + 建议
-- **RenderDoc API**: `controller.DebugVertex(vertid, instid, idx, view)`
+- **RenderDoc API**: `controller.DebugVertex(vertid, instid, idx, view)` → `ContinueDebug` → `FreeTrace`
 
 ### debug_compute_thread
-- **参数**: `event_id`, `group_id=[0,0,0]`, `thread_id=[0,0,0]`, `watch_variables?`
-- **功能**: Compute Shader 线程调试——追踪指定工作组/线程的变量
+- **参数**: `event_id`, `group_id=[0,0,0]`, `thread_id=[0,0,0]`, `mode="summary"`, `watch_variables?`, `run_to_step?`, `run_to_line?`
+- **功能**: Compute Shader 线程调试，支持与 `debug_shader_at_pixel` 相同的 4 种模式（summary/watch/anomaly/step）
 - **回退**: 调试不支持时返回 constant_blocks + rw_resources + 建议
-- **RenderDoc API**: `controller.DebugThread(groupid, threadid)`
+- **RenderDoc API**: `controller.DebugThread(groupid, threadid)` → `ContinueDebug` → `FreeTrace`
 
 ---
 

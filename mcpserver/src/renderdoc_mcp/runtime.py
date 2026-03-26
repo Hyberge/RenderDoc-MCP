@@ -21,6 +21,11 @@ CACHE_MAX_ENTRIES = max(10, int(os.environ.get("RENDERDOC_MCP_CACHE_MAX_ENTRIES"
 CACHE_DEFAULT_PAGE_SIZE = max(1, int(os.environ.get("RENDERDOC_MCP_CACHE_DEFAULT_PAGE_SIZE", "50")))
 CACHE_MAX_PAGE_SIZE = max(CACHE_DEFAULT_PAGE_SIZE, int(os.environ.get("RENDERDOC_MCP_CACHE_MAX_PAGE_SIZE", "200")))
 
+# Per-tool timeout overrides (tool_name -> timeout_ms)
+_TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
+    "open_capture": 60000,  # 60s — large captures with shader debug path scanning take longer
+}
+
 
 CACHE_PREVIEW_ITEMS = max(1, int(os.environ.get("RENDERDOC_MCP_CACHE_PREVIEW_ITEMS", "3")))
 CACHE_PREVIEW_LINES = max(1, int(os.environ.get("RENDERDOC_MCP_CACHE_PREVIEW_LINES", "12")))
@@ -120,6 +125,8 @@ def install_tool_runtime_guards(mcp) -> None:
 def wrap_tool_function(fn: Callable[..., Any], tool_name: str) -> Callable[..., Any]:
     """Wrap a tool with single-thread execution and timeout handling."""
 
+    tool_timeout_ms = _TOOL_TIMEOUT_OVERRIDES.get(tool_name, DEFAULT_TOOL_TIMEOUT_MS)
+
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         global _active_future, _active_tool_name, _active_started_at
@@ -144,17 +151,17 @@ def wrap_tool_function(fn: Callable[..., Any], tool_name: str) -> Callable[..., 
             future.add_done_callback(_clear_active_future)
 
         try:
-            return future.result(timeout=DEFAULT_TOOL_TIMEOUT_MS / 1000.0)
+            return future.result(timeout=tool_timeout_ms / 1000.0)
         except FutureTimeoutError:
             elapsed = time.monotonic() - (_active_started_at or time.monotonic())
             return _json_dumps({
                 "error": (
-                    f"Tool '{tool_name}' timed out after {DEFAULT_TOOL_TIMEOUT_MS}ms. "
+                    f"Tool '{tool_name}' timed out after {tool_timeout_ms}ms. "
                     "The tool is still finishing in the background; wait or restart the MCP server if it remains stuck."
                 ),
                 "code": "TOOL_TIMEOUT",
                 "tool_name": tool_name,
-                "timeout_ms": DEFAULT_TOOL_TIMEOUT_MS,
+                "timeout_ms": tool_timeout_ms,
                 "elapsed_ms": int(elapsed * 1000),
             })
         except Exception as exc:

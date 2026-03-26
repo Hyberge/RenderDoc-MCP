@@ -34,6 +34,41 @@ def _reflection_fallback(stage: str, refl) -> dict:
     return result
 
 
+def _apply_line_filter(
+    all_lines: list[str],
+    total_lines: int,
+    line_range: list[int] | None,
+    search: str | None,
+) -> tuple[str, str | None]:
+    """Apply line_range or search filter to lines. Returns (filtered_text, note)."""
+    if line_range is not None and len(line_range) == 2:
+        start = max(1, line_range[0]) - 1
+        end = min(total_lines, line_range[1])
+        filtered_lines = all_lines[start:end]
+        return "\n".join(filtered_lines), f"Showing lines {start+1}–{end} of {total_lines}"
+
+    if search is not None:
+        kw = search.lower()
+        context = 5
+        include: set[int] = set()
+        for i, line in enumerate(all_lines):
+            if kw in line.lower():
+                for j in range(max(0, i - context), min(total_lines, i + context + 1)):
+                    include.add(j)
+        if not include:
+            return "", f"No matches for '{search}' in {total_lines} lines"
+        result_lines: list[str] = []
+        prev = -2
+        for i in sorted(include):
+            if i > prev + 1:
+                result_lines.append("...")
+            result_lines.append(f"{i+1:4d}: {all_lines[i]}")
+            prev = i
+        return "\n".join(result_lines), f"Found '{search}' in {total_lines} total lines"
+
+    return "\n".join(all_lines), None
+
+
 def register(mcp: FastMCP):
     @mcp.tool()
     def disassemble_shader(
@@ -45,12 +80,14 @@ def register(mcp: FastMCP):
     ) -> str:
         """Disassemble the shader bound at the specified stage.
 
-        If target is omitted, tries all available targets in order and returns the
-        first successful result. Falls back to reflection info if all disassembly fails.
+        If target is omitted and HLSL source is available (via shader debug info / PDB),
+        returns the HLSL source code. Otherwise tries all disassembly targets.
+        Falls back to reflection info if all disassembly fails.
 
         Args:
             stage: Shader stage (vertex, hull, domain, geometry, pixel, compute).
-            target: Disassembly target/format. If omitted, tries all available targets.
+            target: Disassembly target/format. Use "hlsl" to force HLSL source view.
+                    If omitted, auto-selects HLSL source when available.
             event_id: Optional event ID to navigate to first.
             line_range: [start_line, end_line] (1-based). Only return lines in this range.
             search: Keyword to search in the disassembly. Returns matching lines with
@@ -73,6 +110,59 @@ def register(mcp: FastMCP):
         if refl is None:
             return to_json(make_error(f"No shader bound at stage '{stage}'", "API_ERROR"))
 
+        # Check for HLSL source from debug info (PDB)
+        source_files: list[dict] = []
+        try:
+            debug_info = refl.debugInfo
+            if debug_info and hasattr(debug_info, "files") and len(debug_info.files) > 0:
+                for f in debug_info.files:
+                    if f.contents and f.contents.strip():
+                        source_files.append({
+                            "filename": f.filename,
+                            "contents": f.contents,
+                        })
+        except Exception:
+            pass
+
+        # If target is "hlsl" or (target is None and source is available), return HLSL
+        want_hlsl = (target is not None and target.lower() == "hlsl") or \
+                    (target is None and len(source_files) > 0)
+
+        if want_hlsl and source_files:
+            # Use first file (entry point) as primary source
+            primary = source_files[0]
+            disasm = primary["contents"]
+            all_lines = disasm.splitlines()
+            total_lines = len(all_lines)
+
+            disasm_out, note = _apply_line_filter(all_lines, total_lines, line_range, search)
+
+            result: dict = {
+                "stage": stage,
+                "target": "hlsl",
+                "source_type": "hlsl",
+                "source_file": primary["filename"],
+                "total_lines": total_lines,
+                "total_source_files": len(source_files),
+                "disassembly": disasm_out,
+            }
+            if len(source_files) > 1:
+                result["other_source_files"] = [
+                    f["filename"] for f in source_files[1:]
+                ]
+            if note:
+                result["note"] = note
+            return to_json(result)
+
+        if want_hlsl and not source_files:
+            return to_json(make_error(
+                "No HLSL source available. Shader was compiled without debug info, "
+                "or shader_debug_paths was not set in open_capture. "
+                "Use a disassembly target instead.",
+                "API_ERROR",
+            ))
+
+        # Standard disassembly path
         if stage_enum == rd.ShaderStage.Compute:
             pipe = state.GetComputePipelineObject()
         else:
@@ -82,13 +172,13 @@ def register(mcp: FastMCP):
         if not targets:
             return to_json(_reflection_fallback(stage, refl))
 
-        disasm: str | None = None
-        used_target: str | None = None
+        disasm = None
+        used_target = None
 
         if target is not None:
             if target not in targets:
                 return to_json(make_error(
-                    f"Unknown disassembly target: {target}. Available: {targets}", "API_ERROR"
+                    f"Unknown disassembly target: {target}. Available: {list(targets) + (['hlsl'] if source_files else [])}", "API_ERROR"
                 ))
             disasm = session.controller.DisassembleShader(pipe, refl, target)
             used_target = target
@@ -108,49 +198,25 @@ def register(mcp: FastMCP):
             result["available_targets"] = list(targets)
             return to_json(result)
 
-        # Apply line_range filter
         all_lines = disasm.splitlines()
         total_lines = len(all_lines)
+        disasm_out, note = _apply_line_filter(all_lines, total_lines, line_range, search)
 
-        if line_range is not None and len(line_range) == 2:
-            start = max(1, line_range[0]) - 1  # convert to 0-based
-            end = min(total_lines, line_range[1])
-            filtered_lines = all_lines[start:end]
-            disasm_out = "\n".join(filtered_lines)
-            note = f"Showing lines {start+1}–{end} of {total_lines}"
-        elif search is not None:
-            kw = search.lower()
-            context = 5
-            include: set[int] = set()
-            for i, line in enumerate(all_lines):
-                if kw in line.lower():
-                    for j in range(max(0, i - context), min(total_lines, i + context + 1)):
-                        include.add(j)
-            if not include:
-                note = f"No matches for '{search}' in {total_lines} lines"
-                disasm_out = ""
-            else:
-                result_lines = []
-                prev = -2
-                for i in sorted(include):
-                    if i > prev + 1:
-                        result_lines.append("...")
-                    result_lines.append(f"{i+1:4d}: {all_lines[i]}")
-                    prev = i
-                disasm_out = "\n".join(result_lines)
-                note = f"Found '{search}' in {total_lines} total lines"
-        else:
-            disasm_out = disasm
-            note = None
+        available = list(targets)
+        if source_files:
+            available.insert(0, "hlsl")
 
-        result: dict = {
+        result = {
             "stage": stage,
             "target": used_target,
-            "available_targets": list(targets),
+            "available_targets": available,
             "source_type": "disasm",
             "total_lines": total_lines,
             "disassembly": disasm_out,
         }
+        if source_files:
+            result["hlsl_available"] = True
+            result["hlsl_hint"] = "HLSL source is available. Use target='hlsl' to view source code."
         if note:
             result["note"] = note
         return to_json(result)
