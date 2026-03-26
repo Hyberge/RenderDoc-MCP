@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -27,6 +28,9 @@ def register(mcp: FastMCP):
     def _fetch_timing_data() -> tuple[dict[int, float], bool]:
         """Fetch GPU Duration counter data, cached for the session.
 
+        Uses rd.GPUCounter.EventGPUDuration directly (same as RenderDoc GUI's
+        Event Browser "time actions" button) for reliable counter selection.
+
         Returns (counter_data_ms, has_real_timing).
         """
         nonlocal _timing_cache
@@ -40,20 +44,29 @@ def register(mcp: FastMCP):
         has_real_timing = False
         try:
             counters = session.controller.EnumerateCounters()
-            timing_counter = None
-            timing_unit_is_seconds = False
-            for c in counters:
-                info = session.controller.DescribeCounter(c)
-                if "time" in info.name.lower() or "duration" in info.name.lower():
-                    timing_counter = c
-                    timing_unit_is_seconds = (info.unit == rd.CounterUnit.Seconds)
-                    break
-            if timing_counter is not None:
+            # Use the exact same counter as RenderDoc GUI: GPUCounter.EventGPUDuration
+            # This counter always returns seconds (CounterUnit.Seconds).
+            timing_counter = rd.GPUCounter.EventGPUDuration
+            if timing_counter in counters:
                 results = session.controller.FetchCounters([timing_counter])
                 for r in results:
-                    value_ms = r.value.d * 1000.0 if timing_unit_is_seconds else r.value.d
-                    counter_data[r.eventId] = value_ms
-                has_real_timing = True
+                    value_ms = r.value.d * 1000.0  # seconds → ms
+                    if value_ms >= 0.0:
+                        counter_data[r.eventId] = value_ms
+                has_real_timing = len(counter_data) > 0
+            else:
+                # Fallback: search by name (for non-standard drivers/IHV counters)
+                for c in counters:
+                    info = session.controller.DescribeCounter(c)
+                    if "duration" in info.name.lower():
+                        timing_unit_is_seconds = (info.unit == rd.CounterUnit.Seconds)
+                        results = session.controller.FetchCounters([c])
+                        for r in results:
+                            value_ms = r.value.d * 1000.0 if timing_unit_is_seconds else r.value.d
+                            if value_ms >= 0.0:
+                                counter_data[r.eventId] = value_ms
+                        has_real_timing = len(counter_data) > 0
+                        break
         except Exception:
             pass
 
@@ -62,11 +75,29 @@ def register(mcp: FastMCP):
 
     # ---- internal: sum timing for a subtree ----
     def _sum_timing(action, counter_data: dict[int, float]) -> float:
-        """Recursively sum GPU timing for all leaf descendants."""
+        """Sum GPU timing for a subtree, matching RenderDoc GUI's CalculateTotalDuration.
+
+        GUI logic (EventBrowser.cpp:1065-1087):
+        - Iterates direct children of the action
+        - Skips NaN/Inf values
+        - Clamps negative values to 0
+        - For child nodes that are themselves parents, their m_Times[eid] is
+          already populated (processed in reverse order), so summing direct
+          children is equivalent to recursive leaf summation.
+        """
         children = action.children
         if children and len(children) > 0:
-            return sum(_sum_timing(c, counter_data) for c in children)
-        return counter_data.get(action.eventId, 0.0)
+            total = 0.0
+            for c in children:
+                child_ms = _sum_timing(c, counter_data)
+                if math.isnan(child_ms) or math.isinf(child_ms):
+                    continue
+                total += max(0.0, child_ms)
+            return total
+        val = counter_data.get(action.eventId, 0.0)
+        if math.isnan(val) or math.isinf(val):
+            return 0.0
+        return max(0.0, val)
 
     def _count_leaves(action) -> tuple[int, int, int]:
         """Return (draw_count, dispatch_count, total_leaf_count) in subtree."""
@@ -88,6 +119,7 @@ def register(mcp: FastMCP):
         max_depth: int = 2,
         parent_eid: Optional[int] = None,
         min_ms: float = 0.0,
+        eid_range: Optional[list[int]] = None,
     ) -> str:
         """Get hierarchical GPU timing like a flame graph.
 
@@ -100,12 +132,19 @@ def register(mcp: FastMCP):
           2. get_pass_timing(parent_eid=<expensive>)  → drill into that node
           3. Repeat until you find the hotspot leaf draw calls
 
+        For flat captures (no debug markers), use eid_range to summarize a
+        specific EID range instead of listing all actions:
+          get_pass_timing(eid_range=[100, 500])       → summary for EID 100-500
+
         Args:
             max_depth: How many levels deep to return (default 2).
                        Children beyond this depth are summarized.
             parent_eid: Event ID of a parent node to drill into.
                         Only its subtree is returned. Omit to start from root.
             min_ms: Hide nodes below this threshold in ms (default 0, show all).
+            eid_range: Optional [start_eid, end_eid] to restrict to a specific
+                       EID range. Returns a summary with total duration, action
+                       counts, and the top-N most expensive actions in that range.
         """
         session = get_session()
         err = session.require_open()
@@ -115,6 +154,87 @@ def register(mcp: FastMCP):
         counter_data, has_real_timing = _fetch_timing_data()
         sf = session.structured_file
 
+        # ---- EID range mode: summarize a specific EID range ----
+        if eid_range is not None:
+            if not isinstance(eid_range, (list, tuple)) or len(eid_range) != 2:
+                return to_json(make_error(
+                    "eid_range must be [start_eid, end_eid]", "INVALID_PARAM"))
+            start_eid, end_eid = int(eid_range[0]), int(eid_range[1])
+            if start_eid > end_eid:
+                start_eid, end_eid = end_eid, start_eid
+
+            # Collect root actions in range
+            root_actions = session.controller.GetRootActions()
+            range_actions = [
+                a for a in root_actions
+                if start_eid <= a.eventId <= end_eid
+            ]
+
+            # Compute stats
+            range_total_ms = 0.0
+            draw_count = 0
+            dispatch_count = 0
+            clear_count = 0
+            other_count = 0
+            top_actions: list[tuple[float, int, str]] = []  # (ms, eid, name)
+
+            for a in range_actions:
+                a_ms = _sum_timing(a, counter_data)
+                if math.isnan(a_ms) or math.isinf(a_ms):
+                    continue
+                a_ms = max(0.0, a_ms)
+                range_total_ms += a_ms
+
+                d, dp, _ = _count_leaves(a)
+                draw_count += d
+                dispatch_count += dp
+                if a.flags & rd.ActionFlags.Clear:
+                    clear_count += 1
+                elif not (a.flags & rd.ActionFlags.Drawcall or a.flags & rd.ActionFlags.Dispatch):
+                    other_count += 1
+
+                top_actions.append((a_ms, a.eventId, a.GetName(sf)))
+
+            # Sort by duration descending, keep top entries
+            top_actions.sort(key=lambda x: -x[0])
+            top_n = 15
+            top_list = [
+                {"eid": eid, "name": name, "duration_ms": round(ms, 4)}
+                for ms, eid, name in top_actions[:top_n]
+            ]
+
+            # Frame total for percentage
+            frame_total_ms = 0.0
+            for a in root_actions:
+                t = _sum_timing(a, counter_data)
+                if not math.isnan(t) and not math.isinf(t):
+                    frame_total_ms += max(0.0, t)
+
+            try:
+                frame_info = session.controller.GetFrameInfo()
+                frame_name = f"Frame #{frame_info.frameNumber}"
+            except Exception:
+                frame_name = "Frame"
+
+            return to_json({
+                "has_real_timing": has_real_timing,
+                "timing_unit": "ms",
+                "eid_range": [start_eid, end_eid],
+                "actions_in_range": len(range_actions),
+                "range_duration_ms": round(range_total_ms, 4),
+                "frame_total_ms": round(frame_total_ms, 4),
+                "range_pct_of_frame": round(
+                    range_total_ms / frame_total_ms * 100, 2
+                ) if frame_total_ms > 0 else 0.0,
+                "draws": draw_count,
+                "dispatches": dispatch_count,
+                "clears": clear_count,
+                "other_actions": other_count,
+                "top_expensive": top_list,
+                "frame_name": frame_name,
+            })
+
+        # ---- Normal mode: hierarchical timing tree ----
         # Locate the starting action list
         if parent_eid is not None:
             parent_action = session.action_map.get(parent_eid)
@@ -145,8 +265,20 @@ def register(mcp: FastMCP):
             parent_name = parent_action.GetName(sf)
         else:
             action_list = session.controller.GetRootActions()
-            parent_total_ms = sum(_sum_timing(a, counter_data) for a in action_list)
-            parent_name = "Frame"
+            # Match GUI's CalculateTotalDuration for the root frame node:
+            # sum direct children's timing, skip NaN/Inf, clamp negative to 0
+            parent_total_ms = 0.0
+            for a in action_list:
+                child_ms = _sum_timing(a, counter_data)
+                if math.isnan(child_ms) or math.isinf(child_ms):
+                    continue
+                parent_total_ms += max(0.0, child_ms)
+            # Use frame number from capture info, matching GUI's "Frame #N" display
+            try:
+                frame_info = session.controller.GetFrameInfo()
+                parent_name = f"Frame #{frame_info.frameNumber}"
+            except Exception:
+                parent_name = "Frame"
             parent_eid = None
 
         def _build_node(action, depth: int, max_d: int) -> dict | None:
