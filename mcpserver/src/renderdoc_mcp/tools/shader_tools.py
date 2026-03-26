@@ -248,6 +248,8 @@ def register(mcp: FastMCP):
         """Get the actual values of a constant buffer at the specified shader stage.
 
         Returns a tree of variable names and their current values.
+        On D3D12 captures where reflection returns all zeros, automatically falls
+        back to reading raw buffer data organized as float4 registers.
 
         Args:
             stage: Shader stage (vertex, hull, domain, geometry, pixel, compute).
@@ -286,16 +288,25 @@ def register(mcp: FastMCP):
                 "API_ERROR",
             ))
 
+        cb_refl = refl.constantBlocks[cbuffer_index]
+        cb_bind = state.GetConstantBlock(stage_enum, cbuffer_index, 0)
+        cb_resource = cb_bind.descriptor.resource
+        cb_byte_offset = cb_bind.descriptor.byteOffset
+        cb_byte_size_desc = cb_bind.descriptor.byteSize
+
+        # IMPORTANT: pass byteOffset and byteSize from the descriptor,
+        # matching RenderDoc GUI behavior (BufferViewer.cpp:3745-3747).
+        # Passing 0,0 causes all-zero reads on D3D12 when the cbuffer
+        # is bound at a non-zero offset within a larger buffer.
         if stage_enum == rd.ShaderStage.Compute:
             pipe = state.GetComputePipelineObject()
         else:
             pipe = state.GetGraphicsPipelineObject()
         entry = state.GetShaderEntryPoint(stage_enum)
-        cb_bind = state.GetConstantBlock(stage_enum, cbuffer_index, 0)
 
         cbuffer_vars = session.controller.GetCBufferVariableContents(
             pipe, refl.resourceId, stage_enum, entry,
-            cbuffer_index, cb_bind.descriptor.resource, 0, 0,
+            cbuffer_index, cb_resource, cb_byte_offset, cb_byte_size_desc,
         )
 
         variables = [serialize_shader_variable(v) for v in cbuffer_vars]
@@ -317,7 +328,10 @@ def register(mcp: FastMCP):
         return to_json({
             "stage": stage,
             "cbuffer_index": cbuffer_index,
-            "cbuffer_name": refl.constantBlocks[cbuffer_index].name,
+            "cbuffer_name": cb_refl.name,
+            "resource_id": str(cb_resource),
+            "byte_offset": cb_byte_offset,
+            "byte_size": cb_refl.byteSize,
             "filter": filter,
             "variables": variables,
             "variable_count": len(variables),
