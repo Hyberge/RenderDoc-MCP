@@ -25,52 +25,96 @@ def register(mcp: FastMCP):
     # ---- internal: fetch GPU timing counter data (cached per session) ----
     _timing_cache: dict | None = None
 
-    def _fetch_timing_data() -> tuple[dict[int, float], bool]:
-        """Fetch GPU Duration counter data, cached for the session.
+    # Number of replay passes for timing (like PIX's multi-replay averaging).
+    # Pass 0 is a warmup pass (discarded) to prime GPU caches and stabilize clocks.
+    # Remaining passes are measured; the median per-event value is used.
+    _TIMING_WARMUP_PASSES = 1
+    _TIMING_MEASURE_PASSES = 3   # odd number → clean median
 
-        Uses rd.GPUCounter.EventGPUDuration directly (same as RenderDoc GUI's
-        Event Browser "time actions" button) for reliable counter selection.
+    def _fetch_timing_single_pass() -> dict[int, float] | None:
+        """Run one FetchCounters pass and return {eid: ms} or None on failure."""
+        session = get_session()
+        try:
+            counters = session.controller.EnumerateCounters()
+            timing_counter = rd.GPUCounter.EventGPUDuration
+            if timing_counter not in counters:
+                # Fallback: search by name
+                for c in counters:
+                    info = session.controller.DescribeCounter(c)
+                    if "duration" in info.name.lower():
+                        timing_counter = c
+                        break
+                else:
+                    return None
+
+            results = session.controller.FetchCounters([timing_counter])
+            info = session.controller.DescribeCounter(timing_counter)
+            is_seconds = (info.unit == rd.CounterUnit.Seconds)
+
+            data: dict[int, float] = {}
+            for r in results:
+                value_ms = r.value.d * 1000.0 if is_seconds else r.value.d
+                if value_ms >= 0.0:
+                    data[r.eventId] = value_ms
+            return data if data else None
+        except Exception:
+            return None
+
+    def _fetch_timing_data() -> tuple[dict[int, float], bool]:
+        """Fetch GPU Duration counter data with improved accuracy.
+
+        Accuracy improvements over vanilla RenderDoc single-pass timing:
+        1. Warmup pass(es): prime GPU caches / let clocks stabilize (discarded).
+        2. Multiple measurement passes: reduce noise from DVFS, scheduling jitter.
+        3. Median selection: robust against outliers (better than mean).
+
+        This mirrors PIX's "Collect Timing Data" which replays multiple times
+        and averages results. We use median instead of mean for robustness.
 
         Returns (counter_data_ms, has_real_timing).
         """
         nonlocal _timing_cache
         session = get_session()
-        # Invalidate cache if capture changed
         cache_key = session.filepath
         if _timing_cache is not None and _timing_cache.get("_key") == cache_key:
             return _timing_cache["data"], _timing_cache["real"]
 
+        import statistics
+
+        # Warmup passes (results discarded — stabilize GPU clocks & caches)
+        for _ in range(_TIMING_WARMUP_PASSES):
+            _fetch_timing_single_pass()
+
+        # Measurement passes
+        all_passes: list[dict[int, float]] = []
+        for _ in range(_TIMING_MEASURE_PASSES):
+            result = _fetch_timing_single_pass()
+            if result is not None:
+                all_passes.append(result)
+
         counter_data: dict[int, float] = {}
         has_real_timing = False
-        try:
-            counters = session.controller.EnumerateCounters()
-            # Use the exact same counter as RenderDoc GUI: GPUCounter.EventGPUDuration
-            # This counter always returns seconds (CounterUnit.Seconds).
-            timing_counter = rd.GPUCounter.EventGPUDuration
-            if timing_counter in counters:
-                results = session.controller.FetchCounters([timing_counter])
-                for r in results:
-                    value_ms = r.value.d * 1000.0  # seconds → ms
-                    if value_ms >= 0.0:
-                        counter_data[r.eventId] = value_ms
-                has_real_timing = len(counter_data) > 0
-            else:
-                # Fallback: search by name (for non-standard drivers/IHV counters)
-                for c in counters:
-                    info = session.controller.DescribeCounter(c)
-                    if "duration" in info.name.lower():
-                        timing_unit_is_seconds = (info.unit == rd.CounterUnit.Seconds)
-                        results = session.controller.FetchCounters([c])
-                        for r in results:
-                            value_ms = r.value.d * 1000.0 if timing_unit_is_seconds else r.value.d
-                            if value_ms >= 0.0:
-                                counter_data[r.eventId] = value_ms
-                        has_real_timing = len(counter_data) > 0
-                        break
-        except Exception:
-            pass
 
-        _timing_cache = {"_key": cache_key, "data": counter_data, "real": has_real_timing}
+        if all_passes:
+            # Collect all event IDs seen across passes
+            all_eids: set[int] = set()
+            for p in all_passes:
+                all_eids.update(p.keys())
+
+            # For each event, take the median across passes
+            for eid in all_eids:
+                values = [p[eid] for p in all_passes if eid in p]
+                if values:
+                    counter_data[eid] = statistics.median(values)
+
+            has_real_timing = len(counter_data) > 0
+
+        _timing_cache = {
+            "_key": cache_key,
+            "data": counter_data,
+            "real": has_real_timing,
+            "passes": len(all_passes),
+        }
         return counter_data, has_real_timing
 
     # ---- internal: sum timing for a subtree ----
@@ -232,6 +276,7 @@ def register(mcp: FastMCP):
                 "other_actions": other_count,
                 "top_expensive": top_list,
                 "frame_name": frame_name,
+                "measurement_passes": _timing_cache.get("passes", 1) if _timing_cache else 1,
             })
 
         # ---- Normal mode: hierarchical timing tree ----
@@ -345,6 +390,7 @@ def register(mcp: FastMCP):
                 children_nodes.append(node)
         children_nodes.sort(key=lambda n: -n["duration_ms"])
 
+        passes_used = _timing_cache.get("passes", 1) if _timing_cache else 1
         result: dict = {
             "has_real_timing": has_real_timing,
             "timing_unit": "ms",
@@ -352,11 +398,16 @@ def register(mcp: FastMCP):
             "parent_eid": parent_eid,
             "parent_name": parent_name,
             "max_depth": max_depth,
+            "measurement_passes": passes_used,
             "children": children_nodes,
         }
         if not has_real_timing:
             result["note"] = ("GPU timing counters unavailable — duration values "
                               "are heuristic estimates based on triangle counts")
+        elif passes_used > 1:
+            result["note"] = (f"Timing from median of {passes_used} replay passes "
+                              f"(+{_TIMING_WARMUP_PASSES} warmup). "
+                              "Values are per-draw GPU duration, not wall-clock.")
         return to_json(result)
 
     @mcp.tool()
