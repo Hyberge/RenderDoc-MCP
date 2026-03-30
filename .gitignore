@@ -1,2 +1,5 @@
 build
 .codebuddy
+/mcp.json
+test
+docs
