@@ -351,13 +351,17 @@ function Invoke-MSBuildSolutionClean {
         "/p:PlatformToolset=$PlatformToolset",
         "/m",
         "/v:minimal",
+        "/nodeReuse:false",
         "/p:AdditionalOptions=/utf-8",
         $FileLogger
     )
 
     Write-Host "  Running: MSBuild renderdoc.sln /t:Clean"
+    $SavedEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
     $CleanResult = & $MsBuildPath @CleanArgs 2>&1
     $CleanExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $SavedEAP
 
     if ($CleanExitCode -ne 0) {
         Write-Host "`n[Clean Output]" -ForegroundColor Yellow
@@ -423,13 +427,17 @@ function Invoke-MSBuildProject {
         "/p:SolutionDir=$($RenderDocSlnDir + '\')",
         "/m",
         "/v:minimal",
+        "/nodeReuse:false",
         "/p:AdditionalOptions=/utf-8",
         $FileLogger
     )
 
     Write-Host "  Running: MSBuild $DisplayName"
+    $SavedEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
     $ProjectBuildResult = & $MsBuildPath @ProjectBuildArgs 2>&1
     $ProjectBuildExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $SavedEAP
 
     if ($ProjectBuildExitCode -ne 0) {
         Write-Host "`n[Build Output]" -ForegroundColor Yellow
@@ -532,7 +540,30 @@ if (Test-Path $VswherePath) {
     $VsInstallPath = & $VswherePath -latest -products * -requires Microsoft.Component.MSBuild -property installationPath 2>$null
     if ($VsInstallPath -and (Test-Path $VsInstallPath)) {
         $VsVersion = & $VswherePath -latest -products * -requires Microsoft.Component.MSBuild -property catalog_productLineVersion 2>$null
-        $MsBuildPath = & $VswherePath -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe 2>$null | Select-Object -First 1
+        # Prefer 64-bit MSBuild (amd64) to avoid address-space issues in large builds
+        $MsBuild64 = & $VswherePath -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\amd64\MSBuild.exe 2>$null | Select-Object -First 1
+        if ($MsBuild64) {
+            # Verify the 64-bit MSBuild is functional (VS2025 Preview has a known
+            # TypeLoadException bug in amd64\MSBuild.exe)
+            $SavedEAP = $ErrorActionPreference
+            $ErrorActionPreference = "SilentlyContinue"
+            & $MsBuild64 /version 2>&1 | Out-Null
+            $VerifyExit = $LASTEXITCODE
+            $ErrorActionPreference = $SavedEAP
+            if ($VerifyExit -eq 0) {
+                $MsBuildPath = $MsBuild64
+            } else {
+                Write-Host ""
+                Write-Host "  [WARNING] 64-bit MSBuild found but appears broken (exit code $VerifyExit):" -ForegroundColor Yellow
+                Write-Host "    $MsBuild64" -ForegroundColor Yellow
+                Write-Host "  Please run Visual Studio Installer -> Modify -> Repair to fix the installation." -ForegroundColor Yellow
+                Write-Host "  Falling back to 32-bit MSBuild." -ForegroundColor Yellow
+                Write-Host ""
+            }
+        }
+        if (-not $MsBuildPath) {
+            $MsBuildPath = & $VswherePath -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe 2>$null | Select-Object -First 1
+        }
     }
 }
 
