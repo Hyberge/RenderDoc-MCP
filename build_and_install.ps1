@@ -351,7 +351,7 @@ function Invoke-MSBuildSolutionClean {
         "/p:PlatformToolset=$PlatformToolset",
         "/m",
         "/v:minimal",
-        "/utf-8",
+        "/p:AdditionalOptions=/utf-8",
         $FileLogger
     )
 
@@ -423,7 +423,7 @@ function Invoke-MSBuildProject {
         "/p:SolutionDir=$($RenderDocSlnDir + '\')",
         "/m",
         "/v:minimal",
-        "/utf-8",
+        "/p:AdditionalOptions=/utf-8",
         $FileLogger
     )
 
