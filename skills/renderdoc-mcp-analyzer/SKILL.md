@@ -1,13 +1,13 @@
 ---
 name: renderdoc-mcp-analyzer
-description: "This skill provides comprehensive knowledge for developing, extending, debugging, and maintaining the RenderDoc MCP Server -- a Python-based MCP server (54 tools, 3 prompts) that enables AI assistants to analyze GPU frame captures (.rdc files) for graphics debugging and performance analysis. This skill should be used when working on renderdoc-mcp source code, adding new tools, fixing bugs in existing tools, understanding the architecture, or extending diagnostic capabilities. It covers the full codebase (server, session, runtime, util, 10 tool modules), the RenderDoc Python replay API, and common graphics debugging workflows (pipeline state, shader analysis, pixel diagnostics, performance profiling, mobile GPU risk assessment)."
+description: "This skill provides comprehensive knowledge for developing, extending, debugging, and maintaining the RenderDoc MCP Server -- a Python-based MCP server (55 tools, 3 prompts) that enables AI assistants to analyze GPU frame captures (.rdc files) for graphics debugging and performance analysis. This skill should be used when working on renderdoc-mcp source code, adding new tools, fixing bugs in existing tools, understanding the architecture, or extending diagnostic capabilities. It covers the full codebase (server, session, runtime, util, 10 tool modules), the RenderDoc Python replay API, and common graphics debugging workflows (pipeline state, shader analysis, pixel diagnostics, performance profiling, mobile GPU risk assessment)."
 ---
 
 # RenderDoc MCP Analyzer Skill
 
 ## Overview
 
-The RenderDoc MCP Server is a Python-based Model Context Protocol server enabling AI-assisted GPU frame capture analysis. It provides **54 tools** across 10 categories and **3 built-in prompt templates** for guided debugging workflows.
+The RenderDoc MCP Server is a Python-based Model Context Protocol server enabling AI-assisted GPU frame capture analysis. It provides **55 tools** across 10 categories and **3 built-in prompt templates** for guided debugging workflows.
 
 ### When to Use This Skill
 
@@ -41,7 +41,7 @@ AI Client ←—MCP (stdio)—→ FastMCP Server (server.py)
                                     ├── resource_tools.py     (4 tools)
                                     ├── data_tools.py         (9 tools)
                                     ├── shader_tools.py       (3 tools)
-                                    ├── advanced_tools.py     (8 tools)
+                                    ├── advanced_tools.py     (9 tools)
                                     ├── performance_tools.py  (4 tools)
                                     ├── diagnostic_tools.py   (4 tools)
                                     └── inspection_tools.py   (7 tools)

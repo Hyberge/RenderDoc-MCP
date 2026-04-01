@@ -50,7 +50,7 @@ src/renderdoc_mcp/
     ├── resource_tools.py     # 4 工具: list textures/buffers/resources, resource usage
     ├── data_tools.py         # 9 工具: save/read/pick/stats + read_pixels + export_draw_textures + save_rt + export_mesh + get_texture_histogram
     ├── shader_tools.py       # 3 工具: disassemble, reflection, cbuffer contents
-    ├── advanced_tools.py     # 8 工具: pixel_history, post_vs, diff_draws, render_passes, sample_region, debug_shader + debug_vertex + debug_compute_thread
+    ├── advanced_tools.py     # 9 工具: pixel_history, post_vs, diff_draws, render_passes, search_passes, sample_region, debug_shader + debug_vertex + debug_compute_thread
     ├── performance_tools.py  # 4 工具: pass_timing, overdraw, bandwidth, state_changes
     ├── diagnostic_tools.py   # 4 工具: negative_values, precision, reflection_mismatch, mobile_risks
     └── inspection_tools.py   # 7 工具: debug_messages, api_properties, frame_info, diagnostic_overview, descriptor_access, resource_details, cached_message
@@ -61,7 +61,7 @@ src/renderdoc_mcp/
 ### 1. server.py — FastMCP 服务器
 
 - 使用 `FastMCP("renderdoc-mcp")` 创建服务器实例
-- 通过各模块的 `register(mcp)` 函数注册 54 个工具
+- 通过各模块的 `register(mcp)` 函数注册 55 个工具
 - 定义 3 个 Prompt 模板：`debug_draw_call`、`find_rendering_issue`、`analyze_performance`
 - `atexit` 注册清理函数确保资源释放
 

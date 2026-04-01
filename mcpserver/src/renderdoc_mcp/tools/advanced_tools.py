@@ -1,5 +1,5 @@
 """Advanced tools: pixel_history, get_post_vs_data, diff_draw_calls, analyze_render_passes,
-sample_pixel_region, debug_shader_at_pixel."""
+search_passes, sample_pixel_region, debug_shader_at_pixel."""
 
 from __future__ import annotations
 
@@ -1151,18 +1151,14 @@ def register(mcp: FastMCP):
             ),
         })
 
-    @mcp.tool()
-    def analyze_render_passes() -> str:
-        """Auto-detect render pass boundaries and summarize each pass.
+    def _detect_passes(session) -> list[dict]:
+        """Detect render pass boundaries and enrich with RT info.
 
-        Detects passes by Clear actions and output target changes.
-        Returns a list of render passes with draw count, RT info, and event range.
+        Returns a list of pass dicts, each containing:
+            pass_index, start_event, end_event, start_action,
+            draw_count, clear_count, render_targets, render_target_info,
+            draw_eids (list of draw call event IDs within the pass).
         """
-        session = get_session()
-        err = session.require_open()
-        if err:
-            return to_json(err)
-
         sf = session.structured_file
         passes: list[dict] = []
         current_pass: dict | None = None
@@ -1176,10 +1172,8 @@ def register(mcp: FastMCP):
             if not is_clear and not is_draw:
                 continue
 
-            # Determine current outputs
             outputs = tuple(str(o) for o in action.outputs if int(o) != 0)
 
-            # Detect pass boundary: clear or output target change
             new_pass = False
             if is_clear:
                 new_pass = True
@@ -1187,7 +1181,6 @@ def register(mcp: FastMCP):
                 new_pass = True
 
             if new_pass:
-                # Start a new pass
                 if current_pass is not None:
                     passes.append(current_pass)
                 current_pass = {
@@ -1198,6 +1191,7 @@ def register(mcp: FastMCP):
                     "draw_count": 0,
                     "clear_count": 0,
                     "render_targets": list(outputs) if outputs else [],
+                    "draw_eids": [],
                 }
 
             if current_pass is None:
@@ -1209,17 +1203,18 @@ def register(mcp: FastMCP):
                     "draw_count": 0,
                     "clear_count": 0,
                     "render_targets": list(outputs) if outputs else [],
+                    "draw_eids": [],
                 }
 
             current_pass["end_event"] = eid
             if is_draw:
                 current_pass["draw_count"] += 1
+                current_pass["draw_eids"].append(eid)
             if is_clear:
                 current_pass["clear_count"] += 1
 
             if outputs:
                 last_outputs = outputs
-                # Update RT info if changed within pass
                 for o in outputs:
                     if o not in current_pass["render_targets"]:
                         current_pass["render_targets"].append(o)
@@ -1227,7 +1222,7 @@ def register(mcp: FastMCP):
         if current_pass is not None:
             passes.append(current_pass)
 
-        # Enrich with RT size info
+        # Enrich with RT size/format info
         for p in passes:
             rt_info = []
             for rid_str in p["render_targets"]:
@@ -1235,13 +1230,317 @@ def register(mcp: FastMCP):
                 tex_desc = session.get_texture_desc(rid_str)
                 if tex_desc is not None:
                     entry["size"] = f"{tex_desc.width}x{tex_desc.height}"
+                    entry["width"] = tex_desc.width
+                    entry["height"] = tex_desc.height
                     entry["format"] = str(tex_desc.format.Name())
                 rt_info.append(entry)
             p["render_target_info"] = rt_info
 
+        return passes
+
+    @mcp.tool()
+    def analyze_render_passes() -> str:
+        """Auto-detect render pass boundaries and summarize each pass.
+
+        Detects passes by Clear actions and output target changes.
+        Returns a list of render passes with draw count, RT info, and event range.
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+
+        passes = _detect_passes(session)
+
+        # Remove internal-only fields before returning
+        out_passes = []
+        for p in passes:
+            out = {k: v for k, v in p.items() if k != "draw_eids"}
+            out_passes.append(out)
+
         return to_json({
-            "passes": passes,
-            "total_passes": len(passes),
+            "passes": out_passes,
+            "total_passes": len(out_passes),
+        })
+
+    @mcp.tool()
+    def search_passes(
+        name: Optional[str] = None,
+        min_draws: Optional[int] = None,
+        max_draws: Optional[int] = None,
+        adjacent_format: Optional[str] = None,
+        rt: Optional[dict] = None,
+        depth: Optional[dict] = None,
+        stencil: Optional[dict] = None,
+        shader: Optional[dict] = None,
+    ) -> str:
+        """Search render passes by RT properties, pipeline state, and adjacent pass patterns.
+
+        Args:
+            name: Case-insensitive substring to match against the pass's start action name.
+            min_draws: Minimum draw call count in the pass.
+            max_draws: Maximum draw call count in the pass.
+            adjacent_format: RT format substring of the *previous* pass. Useful for pattern
+                             matching like "B8G8R8A8 shadow mask -> R11G11B10 lighting".
+            rt: Render target filter dict. Keys:
+                - format (str | list[str]): RT format substring(s). If a string, matches
+                  any RT in the pass. If a list, matches positionally against the pass's
+                  RT list (e.g. ["R11G11B10", "B8G8R8A8"] for MRT). Use null to skip a slot.
+                - count (int): exact number of bound RTs (1=single, 3=MRT)
+                - width (int): exact RT width
+                - height (int): exact RT height
+            depth: Depth state filter dict. Checks every draw in the candidate pass;
+                pass matches if any draw satisfies ALL keys in the dict. Keys:
+                - enabled (bool): depth test on/off
+                - write (bool): depth write on/off
+                - func (str): comparison function substring, e.g. "Less", "LessEqual"
+            stencil: Stencil state filter dict (front face). Same per-draw semantics. Keys:
+                - enabled (bool): stencil test on/off
+                - func (str): comparison function substring, e.g. "Always", "Equal"
+                - pass_op (str): pass operation substring, e.g. "Replace", "Keep"
+            shader: Shader binding filter dict. Same per-draw semantics. Keys:
+                - has_vs (bool): vertex shader bound?
+                - has_ps (bool): pixel shader bound?
+                - has_cs (bool): compute shader bound?
+
+        Pipeline state filters (depth/stencil/shader) check every draw call in each
+        candidate pass and return matched_draws in the result. Combine with rt/name
+        to narrow candidates first for best performance.
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+
+        all_passes = _detect_passes(session)
+        if not all_passes:
+            return to_json({"matches": [], "count": 0, "total_passes": 0})
+
+        # ── First-layer filter (zero set_event, pure cache) ──
+        candidates: list[tuple[int, dict]] = []  # (index, pass_dict)
+        name_lower = name.lower() if name else None
+        adj_lower = adjacent_format.lower() if adjacent_format else None
+
+        # Extract rt filter keys
+        rt_format = rt.get("format") if rt else None
+        rt_count = rt.get("count") if rt else None
+        rt_width = rt.get("width") if rt else None
+        rt_height = rt.get("height") if rt else None
+
+        for idx, p in enumerate(all_passes):
+            # Name filter
+            if name_lower and name_lower not in p["start_action"].lower():
+                continue
+
+            # Draw count range
+            if min_draws is not None and p["draw_count"] < min_draws:
+                continue
+            if max_draws is not None and p["draw_count"] > max_draws:
+                continue
+
+            # RT count
+            rt_info_list = p.get("render_target_info", [])
+            if rt_count is not None and len(rt_info_list) != rt_count:
+                continue
+
+            # RT width/height
+            if rt_width is not None or rt_height is not None:
+                size_match = False
+                for ri in rt_info_list:
+                    w_ok = rt_width is None or ri.get("width") == rt_width
+                    h_ok = rt_height is None or ri.get("height") == rt_height
+                    if w_ok and h_ok:
+                        size_match = True
+                        break
+                if not size_match:
+                    continue
+
+            # RT format
+            if rt_format is not None:
+                formats_in_pass = [ri.get("format", "") for ri in rt_info_list]
+                if isinstance(rt_format, list):
+                    # Positional match
+                    fmt_match = True
+                    for slot_idx, slot_fmt in enumerate(rt_format):
+                        if slot_fmt is None:
+                            continue
+                        if slot_idx >= len(formats_in_pass):
+                            fmt_match = False
+                            break
+                        if slot_fmt.lower() not in formats_in_pass[slot_idx].lower():
+                            fmt_match = False
+                            break
+                    if not fmt_match:
+                        continue
+                else:
+                    # Any RT matches
+                    fmt_lower = rt_format.lower()
+                    if not any(fmt_lower in f.lower() for f in formats_in_pass):
+                        continue
+
+            # Adjacent format: check previous pass's RT formats
+            if adj_lower is not None:
+                if idx == 0:
+                    continue
+                prev_pass = all_passes[idx - 1]
+                prev_formats = [ri.get("format", "") for ri in prev_pass.get("render_target_info", [])]
+                if not any(adj_lower in f.lower() for f in prev_formats):
+                    continue
+
+            candidates.append((idx, p))
+
+        # ── Second-layer filter (per-draw pipeline state check) ──
+        needs_pipeline = depth is not None or stencil is not None or shader is not None
+        results: list[dict] = []
+        saved_event = session.current_event
+
+        for idx, p in candidates:
+            matched_draws: list[dict] | None = None
+
+            if needs_pipeline:
+                matched_draws = []
+                for draw_eid in p.get("draw_eids", []):
+                    try:
+                        session.set_event(draw_eid)
+                        state = session.controller.GetPipelineState()
+                    except Exception:
+                        continue
+
+                    draw_match = True
+                    draw_state_summary: dict = {"event_id": draw_eid}
+
+                    # Shader filter
+                    if shader is not None and draw_match:
+                        want_vs = shader.get("has_vs")
+                        want_ps = shader.get("has_ps")
+                        want_cs = shader.get("has_cs")
+                        if want_vs is not None:
+                            vs_refl = state.GetShaderReflection(rd.ShaderStage.Vertex)
+                            has_vs = vs_refl is not None
+                            draw_state_summary["has_vs"] = has_vs
+                            if has_vs != want_vs:
+                                draw_match = False
+                        if want_ps is not None and draw_match:
+                            ps_refl = state.GetShaderReflection(rd.ShaderStage.Pixel)
+                            has_ps = ps_refl is not None
+                            draw_state_summary["has_ps"] = has_ps
+                            if has_ps != want_ps:
+                                draw_match = False
+                        if want_cs is not None and draw_match:
+                            cs_refl = state.GetShaderReflection(rd.ShaderStage.Compute)
+                            has_cs = cs_refl is not None
+                            draw_state_summary["has_cs"] = has_cs
+                            if has_cs != want_cs:
+                                draw_match = False
+
+                    # Depth filter
+                    if depth is not None and draw_match:
+                        from renderdoc_mcp.tools.pipeline_tools import _get_depth_state
+                        depth_info = _get_depth_state(state)
+                        if depth_info is None:
+                            draw_match = False
+                        else:
+                            want_enabled = depth.get("enabled")
+                            want_write = depth.get("write")
+                            want_func = depth.get("func")
+                            if want_enabled is not None:
+                                actual = depth_info.get("depth_enable", False)
+                                draw_state_summary["depth_enabled"] = actual
+                                if actual != want_enabled:
+                                    draw_match = False
+                            if want_write is not None and draw_match:
+                                actual = depth_info.get("depth_write_mask", False)
+                                draw_state_summary["depth_write"] = actual
+                                if actual != want_write:
+                                    draw_match = False
+                            if want_func is not None and draw_match:
+                                actual = depth_info.get("depth_function", "")
+                                draw_state_summary["depth_func"] = actual
+                                if want_func.lower() not in actual.lower():
+                                    draw_match = False
+
+                    # Stencil filter
+                    if stencil is not None and draw_match:
+                        want_stencil_enabled = stencil.get("enabled")
+                        want_stencil_func = stencil.get("func")
+                        want_stencil_pass_op = stencil.get("pass_op")
+
+                        # Get stencil enable from depth state
+                        from renderdoc_mcp.tools.pipeline_tools import _get_depth_state
+                        depth_info = _get_depth_state(state)
+                        stencil_enabled = depth_info.get("stencil_enable", False) if depth_info else False
+                        draw_state_summary["stencil_enabled"] = stencil_enabled
+
+                        if want_stencil_enabled is not None:
+                            if stencil_enabled != want_stencil_enabled:
+                                draw_match = False
+
+                        # Get stencil front face ops
+                        if draw_match and (want_stencil_func is not None or want_stencil_pass_op is not None):
+                            try:
+                                from renderdoc_mcp.util import enum_str, COMPARE_FUNC_MAP, STENCIL_OP_MAP
+                                stencil_faces = state.GetStencilFaces()
+                                front = stencil_faces[0]
+                                front_func = enum_str(front.function, COMPARE_FUNC_MAP, "CompareFunc.")
+                                front_pass_op = enum_str(front.passOperation, STENCIL_OP_MAP, "StencilOp.")
+                                draw_state_summary["stencil_func"] = front_func
+                                draw_state_summary["stencil_pass_op"] = front_pass_op
+
+                                if want_stencil_func is not None:
+                                    if want_stencil_func.lower() not in front_func.lower():
+                                        draw_match = False
+                                if want_stencil_pass_op is not None and draw_match:
+                                    if want_stencil_pass_op.lower() not in front_pass_op.lower():
+                                        draw_match = False
+                            except Exception:
+                                draw_match = False
+
+                    if draw_match:
+                        matched_draws.append(draw_state_summary)
+
+                if not matched_draws:
+                    continue
+
+            # Build result entry
+            entry: dict = {k: v for k, v in p.items() if k != "draw_eids"}
+
+            # Add context: prev/next pass summary
+            if idx > 0:
+                prev = all_passes[idx - 1]
+                entry["prev_pass"] = {
+                    "pass_index": prev["pass_index"],
+                    "start_event": prev["start_event"],
+                    "start_action": prev["start_action"],
+                    "draw_count": prev["draw_count"],
+                    "rt_formats": [ri.get("format", "") for ri in prev.get("render_target_info", [])],
+                }
+            if idx < len(all_passes) - 1:
+                nxt = all_passes[idx + 1]
+                entry["next_pass"] = {
+                    "pass_index": nxt["pass_index"],
+                    "start_event": nxt["start_event"],
+                    "start_action": nxt["start_action"],
+                    "draw_count": nxt["draw_count"],
+                    "rt_formats": [ri.get("format", "") for ri in nxt.get("render_target_info", [])],
+                }
+
+            if matched_draws is not None:
+                entry["matched_draws"] = matched_draws
+                entry["matched_draw_count"] = len(matched_draws)
+
+            results.append(entry)
+
+        # Restore event position
+        if needs_pipeline and saved_event is not None:
+            try:
+                session.set_event(saved_event)
+            except Exception:
+                pass
+
+        return to_json({
+            "matches": results,
+            "count": len(results),
+            "total_passes": len(all_passes),
         })
 
 

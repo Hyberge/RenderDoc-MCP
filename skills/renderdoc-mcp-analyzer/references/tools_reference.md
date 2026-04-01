@@ -1,6 +1,6 @@
 # RenderDoc MCP 工具完整参考
 
-## 工具总览（54 个）
+## 工具总览（55 个）
 
 | 分类 | 数量 | 工具列表 |
 |------|------|----------|
@@ -10,7 +10,7 @@
 | Resource Analysis | 4 | list_textures, list_buffers, list_resources, get_resource_usage |
 | Data Extraction | 9 | save_texture, get_buffer_data, pick_pixel, get_texture_stats, read_texture_pixels, export_draw_textures, save_render_target, export_mesh, **get_texture_histogram** |
 | Shader Analysis | 3 | disassemble_shader, get_shader_reflection, get_cbuffer_contents |
-| Advanced | 8 | pixel_history, get_post_vs_data, diff_draw_calls, analyze_render_passes, sample_pixel_region, debug_shader_at_pixel, **debug_vertex**, **debug_compute_thread** |
+| Advanced | 9 | pixel_history, get_post_vs_data, diff_draw_calls, analyze_render_passes, **search_passes**, sample_pixel_region, debug_shader_at_pixel, **debug_vertex**, **debug_compute_thread** |
 | Performance | 4 | get_pass_timing, analyze_overdraw, analyze_bandwidth, analyze_state_changes |
 | Diagnostics | 4 | diagnose_negative_values, diagnose_precision_issues, diagnose_reflection_mismatch, diagnose_mobile_risks |
 | Inspection | 7 | **get_debug_messages**, **get_api_properties**, **get_frame_info**, **get_diagnostic_overview**, **get_descriptor_access**, **get_resource_details**, **get_cached_message** |
@@ -227,6 +227,19 @@
 - **参数**: 无
 - **功能**: 自动检测 render pass 边界（通过 Clear/RT 切换），汇总每个 pass 的 draw count/RT info
 
+### search_passes ⭐ 模糊搜索工具
+- **参数**: `name?`, `min_draws?`, `max_draws?`, `adjacent_format?`, `rt?`（dict）, `depth?`（dict）, `stencil?`（dict）, `shader?`（dict）
+- **功能**: 按 RT 属性、管线状态、相邻 pass 模式多维模糊搜索渲染 pass。采用两层过滤设计：
+  - **第一层（零 set_event）**: name / min_draws / max_draws / adjacent_format / rt{format,count,width,height} 纯缓存过滤
+  - **第二层（逐 draw 检查）**: depth{enabled,write,func} / stencil{enabled,func,pass_op} / shader{has_vs,has_ps,has_cs} 对候选 pass 内每个 draw 做 set_event + GetPipelineState
+- **rt.format**: 支持 str（任意 RT 匹配）或 list[str]（MRT 按位置匹配，null 跳过槽位）
+- **返回**: matches 数组（每个 pass 含 render_target_info + prev_pass/next_pass 上下文 + matched_draws 列表）, count, total_passes
+- **内部实现**: 调用 `_detect_passes(session)` 获取 pass 列表，两层过滤后恢复原始 event 位置
+- **典型用法**:
+  - `search_passes(rt={"format": "R11G11B10"})` — 找灯光 pass
+  - `search_passes(rt={"format": "R11G11B10"}, adjacent_format="B8G8R8A8")` — 找投影灯（前有 shadow mask）
+  - `search_passes(depth={"enabled": true, "func": "Less"}, stencil={"enabled": true})` — 按管线状态搜索
+
 ---
 
 ## Performance Tools (performance_tools.py)
@@ -357,7 +370,7 @@ Layer 1 — 帧级诊断入口:
   get_diagnostic_overview → get_debug_messages
 
 Layer 2 — 帧结构导航:
-  get_frame_overview → list_actions → analyze_render_passes → search_actions
+  get_frame_overview → list_actions → analyze_render_passes → search_passes → search_actions
 
 Layer 3 — 事件级分析:
   set_event → get_draw_call_state → get_pipeline_state → get_shader_bindings
