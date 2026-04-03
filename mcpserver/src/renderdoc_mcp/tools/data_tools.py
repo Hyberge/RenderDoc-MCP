@@ -223,6 +223,7 @@ def register(mcp: FastMCP):
         mip_level: int = 0,
         array_slice: int = 0,
         sample_index: int = 0,
+        raw_hex: bool = False,
         event_id: Optional[int] = None,
     ) -> str:
         """Get the value of a specific pixel in a texture.
@@ -239,6 +240,10 @@ def register(mcp: FastMCP):
             array_slice: Array slice, 3D texture depth slice, or cubemap face index (default 0).
                          Cubemap face order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
             sample_index: MSAA sample index (default 0).
+            raw_hex: If True, include the raw 16-byte pixel data as a hex string (little-endian
+                     byte order, same memory layout as PixelValue union). Useful when the caller
+                     wants to reinterpret the bytes freely (e.g. packed formats, custom structs).
+                     Format: "aabbccdd eeff0011 ..." (space-separated bytes, 16 bytes total).
             event_id: Optional event ID to navigate to first.
         """
         session = get_session()
@@ -312,6 +317,13 @@ def register(mcp: FastMCP):
             "format_name": formatted["format_name"],
             "raw": formatted["raw"],
         }
+
+        # --- Raw hex bytes ---
+        if raw_hex:
+            import struct
+            # PixelValue is a 16-byte union: pack the 4 uints as little-endian bytes
+            raw_bytes = struct.pack("<4I", *[val.uintValue[i] for i in range(4)])
+            result["raw_hex"] = " ".join(f"{b:02x}" for b in raw_bytes)
 
         # --- Texture metadata ---
         if tex_desc is not None:

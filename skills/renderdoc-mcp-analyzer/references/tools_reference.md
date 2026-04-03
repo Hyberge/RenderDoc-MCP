@@ -140,10 +140,11 @@
 - **限制**: 最大 64KB
 
 ### pick_pixel
-- **参数**: `resource_id`, `x`, `y`, `mip_level=0`, `array_slice=0`, `sample_index=0`, `event_id?`
+- **参数**: `resource_id`, `x`, `y`, `mip_level=0`, `array_slice=0`, `sample_index=0`, `raw_hex=False`, `event_id?`
 - **功能**: 读取指定坐标像素值，根据纹理实际格式（compType/compCount）智能返回正确的通道和数据类型
 - **参数校验**: 对 x/y 坐标（考虑 mip 缩放）、mip_level、array_slice、sample_index 均做越界检查
 - **返回**: `value`（仅实际通道，如 depth 纹理只有 depth/stencil）、`data_type`（float/uint/sint）、`format_name`、`raw`（完整 float/uint/int 4 通道原始数据）、`texture_info`（元信息）
+- **raw_hex**: 传 `true` 时额外返回 `raw_hex` 字段 —— PixelValue union 的 16 字节小端十六进制字符串（格式：`"00 00 80 3f ..."`，共 16 字节）。调用者可按任意格式自由解释，如 `struct.unpack("<4f/4I/2d", ...)`、R10G10B10A2 等自定义打包格式
 - **辅助函数**: `_format_pixel_value(val, tex_desc)` — 模块级函数，可被其他工具导入复用
 - **RenderDoc API**: `controller.PickPixel(tex_id, x, y, Subresource(mip, slice, sample), CompType.Typeless)`
 
