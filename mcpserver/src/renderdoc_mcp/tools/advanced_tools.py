@@ -1,5 +1,5 @@
 """Advanced tools: pixel_history, get_post_vs_data, diff_draw_calls, analyze_render_passes,
-search_passes, sample_pixel_region, debug_shader_at_pixel."""
+search_passes, sample_pixel_region, debug_shader_at_pixel, find_pixels."""
 
 from __future__ import annotations
 
@@ -1542,6 +1542,321 @@ def register(mcp: FastMCP):
             "count": len(results),
             "total_passes": len(all_passes),
         })
+
+    # ------------------------------------------------------------------
+    # find_pixels – search for pixels matching filter conditions
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def find_pixels(
+        resource_id: str,
+        filters: Optional[dict] = None,
+        expression: Optional[str] = None,
+        region: Optional[dict] = None,
+        mip_level: int = 0,
+        array_slice: int = 0,
+        array_slice_end: Optional[int] = None,
+        max_results: int = 100,
+        full_scan_threshold: int = 65536,
+        sample_count: int = 1024,
+        event_id: Optional[int] = None,
+    ) -> str:
+        """Search for pixels matching filter conditions in a texture.
+
+        Supports built-in filters (min/max range, bitmask, NaN/Inf/negative detection)
+        and/or a custom Python expression. Uses adaptive search: full scan for small
+        textures, two-phase (sample then refine) for large ones.
+
+        Args:
+            resource_id: The texture resource ID string.
+            filters: Optional dict of built-in filter conditions. Supported keys:
+                min_r/max_r, min_g/max_g, min_b/max_b, min_a/max_a: float range filters.
+                bitmask_r/bitmask_g/bitmask_b/bitmask_a: uint bitmask (AND operation).
+                bitmask_value_r/bitmask_value_g/bitmask_value_b/bitmask_value_a: expected
+                    result after bitmask AND (default 0 = any non-zero match).
+                has_nan: True to match pixels containing NaN.
+                has_inf: True to match pixels containing Inf.
+                has_negative: True to match pixels with negative values.
+            expression: Optional Python expression string for custom filtering.
+                Available variables: r, g, b, a (float), ri, gi, bi, ai (uint),
+                si_r, si_g, si_b, si_a (signed int), math module.
+                Supports all Python operators including bitwise: &, |, ^, ~, <<, >>.
+                Examples: "r > 0.5 and g < 0.1", "(ri >> 24) & 0xFF == 128",
+                         "ri & 0x80000000 != 0", "math.isnan(r)".
+                Max length: 500 characters.
+            region: Optional search region {"x":0, "y":0, "width":W, "height":H}.
+                    If omitted, searches the full texture (per slice).
+            mip_level: Mip level to search (default 0).
+            array_slice: Start array slice, 3D texture depth slice, or cubemap face
+                         index (default 0). Cubemap face order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
+            array_slice_end: End array slice (inclusive). If omitted, only searches
+                             array_slice. Set to search a range of slices, e.g.
+                             array_slice=0, array_slice_end=5 searches slices 0-5.
+            max_results: Maximum matching pixels to return (default 100, max 500).
+            full_scan_threshold: Pixel count threshold for full scan vs two-phase
+                                 search (default 65536). Below this, all pixels are
+                                 scanned; above, sampling is used first.
+                                 Note: threshold applies per-slice.
+            sample_count: Number of sample points for phase-1 sampling when using
+                          two-phase search (default 1024, max 4096).
+            event_id: Optional event ID to navigate to first.
+        """
+        import math as _math
+
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+        err = session.ensure_event(event_id)
+        if err:
+            return to_json(err)
+
+        tex_id = session.resolve_resource_id(resource_id)
+        if tex_id is None:
+            return to_json(make_error(f"Texture resource '{resource_id}' not found", "INVALID_RESOURCE_ID"))
+
+        tex_desc = session.get_texture_desc(resource_id)
+        if tex_desc is None:
+            return to_json(make_error("Could not get texture description", "API_ERROR"))
+
+        # Effective dimensions at mip
+        if mip_level < 0 or mip_level >= tex_desc.mips:
+            return to_json(make_error(
+                f"mip_level {mip_level} out of range [0, {tex_desc.mips - 1}]",
+                "INVALID_PARAMETER",
+            ))
+        eff_w = max(1, tex_desc.width >> mip_level)
+        eff_h = max(1, tex_desc.height >> mip_level)
+
+        # Validate and resolve slice range
+        max_slice = max(tex_desc.arraysize, tex_desc.depth) - 1
+        if max_slice < 0:
+            max_slice = 0
+        if array_slice < 0 or array_slice > max_slice:
+            return to_json(make_error(
+                f"array_slice {array_slice} out of range [0, {max_slice}]",
+                "INVALID_PARAMETER",
+            ))
+        if array_slice_end is None:
+            slice_end = array_slice
+        else:
+            slice_end = min(array_slice_end, max_slice)
+            if slice_end < array_slice:
+                return to_json(make_error(
+                    f"array_slice_end {array_slice_end} must be >= array_slice {array_slice}",
+                    "INVALID_PARAMETER",
+                ))
+        slices = list(range(array_slice, slice_end + 1))
+
+        # Determine search region
+        if region:
+            rx = max(0, region.get("x", 0))
+            ry = max(0, region.get("y", 0))
+            rw = min(region.get("width", eff_w), eff_w - rx)
+            rh = min(region.get("height", eff_h), eff_h - ry)
+        else:
+            rx, ry, rw, rh = 0, 0, eff_w, eff_h
+
+        if rw <= 0 or rh <= 0:
+            return to_json(make_error("Search region is empty", "INVALID_PARAMETER"))
+
+        max_results = min(max_results, 500)
+        sample_count = min(sample_count, 4096)
+
+        # --- Validate and compile expression ---
+        compiled_expr = None
+        if expression is not None:
+            if len(expression) > 500:
+                return to_json(make_error(
+                    f"Expression too long ({len(expression)} chars, max 500)",
+                    "INVALID_PARAMETER",
+                ))
+            try:
+                compiled_expr = compile(expression, "<expression>", "eval")
+            except SyntaxError as e:
+                return to_json(make_error(f"Expression syntax error: {e}", "INVALID_PARAMETER"))
+
+        # --- Build filter function ---
+        f = filters or {}
+
+        def _pixel_matches(fv, uv, iv) -> bool:
+            """Test a pixel against built-in filters and expression."""
+            r, g, b, a = fv[0], fv[1], fv[2], fv[3]
+            ri, gi, bi, ai = uv[0], uv[1], uv[2], uv[3]
+
+            # Built-in range filters
+            for ch_idx, ch_name in enumerate(("r", "g", "b", "a")):
+                mn = f.get(f"min_{ch_name}")
+                if mn is not None and fv[ch_idx] < mn:
+                    return False
+                mx = f.get(f"max_{ch_name}")
+                if mx is not None and fv[ch_idx] > mx:
+                    return False
+
+            # Bitmask filters
+            for ch_idx, ch_name in enumerate(("r", "g", "b", "a")):
+                bm = f.get(f"bitmask_{ch_name}")
+                if bm is not None:
+                    masked = uv[ch_idx] & int(bm)
+                    bm_val = f.get(f"bitmask_value_{ch_name}")
+                    if bm_val is not None:
+                        if masked != int(bm_val):
+                            return False
+                    else:
+                        if masked == 0:
+                            return False
+
+            # Anomaly filters
+            if f.get("has_nan"):
+                if not any(_math.isnan(fv[i]) for i in range(4)):
+                    return False
+            if f.get("has_inf"):
+                if not any(_math.isinf(fv[i]) for i in range(4)):
+                    return False
+            if f.get("has_negative"):
+                if not any(fv[i] < 0 for i in range(4)):
+                    return False
+
+            # Custom expression
+            if compiled_expr is not None:
+                try:
+                    env = {
+                        "__builtins__": {},
+                        "r": r, "g": g, "b": b, "a": a,
+                        "ri": ri, "gi": gi, "bi": bi, "ai": ai,
+                        "si_r": iv[0], "si_g": iv[1], "si_b": iv[2], "si_a": iv[3],
+                        "math": _math,
+                    }
+                    if not eval(compiled_expr, env):
+                        return False
+                except Exception:
+                    return False
+
+            return True
+
+        # --- Import format helper ---
+        from renderdoc_mcp.tools.data_tools import _format_pixel_value
+
+        # --- Search one slice, return (matched_list, pixels_scanned, search_mode, grid_info) ---
+        def _search_slice(sl: int):
+            sub = rd.Subresource(mip_level, sl, 0)
+
+            def _test_pixel(px: int, py: int):
+                try:
+                    val = session.controller.PickPixel(tex_id, px, py, sub, rd.CompType.Typeless)
+                except Exception:
+                    return None
+                fv = [val.floatValue[i] for i in range(4)]
+                uv = [val.uintValue[i] for i in range(4)]
+                iv = [val.intValue[i] for i in range(4)]
+                if _pixel_matches(fv, uv, iv):
+                    fmt = _format_pixel_value(val, tex_desc)
+                    return {"x": px, "y": py, "slice": sl, "value": fmt["value"], "data_type": fmt["data_type"]}
+                return None
+
+            slice_matched: list[dict] = []
+            scanned = 0
+            stopped = False
+            grid_info = None
+            total_px = rw * rh
+            mode = "full_scan" if total_px <= full_scan_threshold else "two_phase"
+
+            if mode == "full_scan":
+                for py in range(ry, ry + rh):
+                    if stopped:
+                        break
+                    for px in range(rx, rx + rw):
+                        scanned += 1
+                        hit = _test_pixel(px, py)
+                        if hit is not None:
+                            slice_matched.append(hit)
+                            if len(slice_matched) >= (max_results - len(matched)):
+                                stopped = True
+                                break
+            else:
+                cols = max(1, int(_math.sqrt(sample_count * rw / max(rh, 1))))
+                rows = max(1, sample_count // cols)
+                cell_w = max(1, rw // cols)
+                cell_h = max(1, rh // rows)
+                hit_cells: set[tuple[int, int]] = set()
+
+                for cr in range(rows):
+                    for cc in range(cols):
+                        px = rx + cc * cell_w + cell_w // 2
+                        py = ry + cr * cell_h + cell_h // 2
+                        if px >= rx + rw or py >= ry + rh:
+                            continue
+                        scanned += 1
+                        hit = _test_pixel(px, py)
+                        if hit is not None:
+                            hit_cells.add((cc, cr))
+
+                if hit_cells:
+                    for (cc, cr) in sorted(hit_cells):
+                        if stopped:
+                            break
+                        cell_x0 = rx + cc * cell_w
+                        cell_y0 = ry + cr * cell_h
+                        cell_x1 = min(cell_x0 + cell_w, rx + rw)
+                        cell_y1 = min(cell_y0 + cell_h, ry + rh)
+                        for py in range(cell_y0, cell_y1):
+                            if stopped:
+                                break
+                            for px in range(cell_x0, cell_x1):
+                                scanned += 1
+                                hit = _test_pixel(px, py)
+                                if hit is not None:
+                                    slice_matched.append(hit)
+                                    if len(slice_matched) >= (max_results - len(matched)):
+                                        stopped = True
+                                        break
+
+                grid_info = {"cols": cols, "rows": rows, "cell_w": cell_w, "cell_h": cell_h,
+                             "phase1_hit_cells": len(hit_cells)}
+
+            return slice_matched, scanned, mode, grid_info, stopped
+
+        # --- Iterate over slices ---
+        matched: list[dict] = []
+        total_pixels_scanned = 0
+        stopped_early = False
+        search_modes_used: set[str] = set()
+
+        for sl in slices:
+            if stopped_early or len(matched) >= max_results:
+                stopped_early = True
+                break
+            sl_matched, sl_scanned, sl_mode, _, sl_stopped = _search_slice(sl)
+            matched.extend(sl_matched)
+            total_pixels_scanned += sl_scanned
+            search_modes_used.add(sl_mode)
+            if sl_stopped:
+                stopped_early = True
+
+        total_pixels = rw * rh * len(slices)
+        search_mode = "two_phase" if "two_phase" in search_modes_used else "full_scan"
+
+        result: dict = {
+            "resource_id": resource_id,
+            "search_region": {"x": rx, "y": ry, "width": rw, "height": rh},
+            "mip_level": mip_level,
+            "array_slice": array_slice,
+            "array_slice_end": slice_end,
+            "slices_searched": len(slices),
+            "format": str(tex_desc.format.Name()),
+            "search_mode": search_mode,
+            "total_pixels": total_pixels,
+            "pixels_scanned": total_pixels_scanned,
+            "matches": matched,
+            "match_count": len(matched),
+            "stopped_early": stopped_early,
+        }
+        if filters:
+            result["filters_applied"] = filters
+        if expression:
+            result["expression"] = expression
+
+        return to_json(result)
 
 
 def _diff_dicts(d1: dict, d2: dict, path: str = "") -> dict:

@@ -1,6 +1,6 @@
 # RenderDoc MCP 工具完整参考
 
-## 工具总览（55 个）
+## 工具总览（56 个）
 
 | 分类 | 数量 | 工具列表 |
 |------|------|----------|
@@ -10,7 +10,7 @@
 | Resource Analysis | 4 | list_textures, list_buffers, list_resources, get_resource_usage |
 | Data Extraction | 9 | save_texture, get_buffer_data, pick_pixel, get_texture_stats, read_texture_pixels, export_draw_textures, save_render_target, export_mesh, **get_texture_histogram** |
 | Shader Analysis | 3 | disassemble_shader, get_shader_reflection, get_cbuffer_contents |
-| Advanced | 9 | pixel_history, get_post_vs_data, diff_draw_calls, analyze_render_passes, **search_passes**, sample_pixel_region, debug_shader_at_pixel, **debug_vertex**, **debug_compute_thread** |
+| Advanced | 10 | pixel_history, get_post_vs_data, diff_draw_calls, analyze_render_passes, **search_passes**, sample_pixel_region, **find_pixels**, debug_shader_at_pixel, **debug_vertex**, **debug_compute_thread** |
 | Performance | 4 | get_pass_timing, analyze_overdraw, analyze_bandwidth, analyze_state_changes |
 | Diagnostics | 4 | diagnose_negative_values, diagnose_precision_issues, diagnose_reflection_mismatch, diagnose_mobile_risks |
 | Inspection | 7 | **get_debug_messages**, **get_api_properties**, **get_frame_info**, **get_diagnostic_overview**, **get_descriptor_access**, **get_resource_details**, **get_cached_message** |
@@ -140,9 +140,12 @@
 - **限制**: 最大 64KB
 
 ### pick_pixel
-- **参数**: `resource_id`, `x`, `y`, `event_id?`
-- **返回**: float RGBA + uint RGBA
-- **RenderDoc API**: `controller.PickPixel(tex_id, x, y, Subresource, CompType.Typeless)`
+- **参数**: `resource_id`, `x`, `y`, `mip_level=0`, `array_slice=0`, `sample_index=0`, `event_id?`
+- **功能**: 读取指定坐标像素值，根据纹理实际格式（compType/compCount）智能返回正确的通道和数据类型
+- **参数校验**: 对 x/y 坐标（考虑 mip 缩放）、mip_level、array_slice、sample_index 均做越界检查
+- **返回**: `value`（仅实际通道，如 depth 纹理只有 depth/stencil）、`data_type`（float/uint/sint）、`format_name`、`raw`（完整 float/uint/int 4 通道原始数据）、`texture_info`（元信息）
+- **辅助函数**: `_format_pixel_value(val, tex_desc)` — 模块级函数，可被其他工具导入复用
+- **RenderDoc API**: `controller.PickPixel(tex_id, x, y, Subresource(mip, slice, sample), CompType.Typeless)`
 
 ### get_texture_stats
 - **参数**: `resource_id`, `event_id?`, `all_slices=False`
@@ -197,6 +200,19 @@
 - **参数**: `event_id?`, `resource_id?`, `region?`, `sample_count=256`, `anomaly_threshold=10.0`
 - **功能**: 均匀网格采样 RT，自动检测 NaN/Inf/负值/极亮像素，生成统计和诊断提示
 - **限制**: 最大 1024 采样点
+
+### find_pixels ⭐ 像素搜索工具
+- **参数**: `resource_id`, `filters?`, `expression?`, `region?`, `mip_level=0`, `array_slice=0`, `array_slice_end?`, `max_results=100`, `full_scan_threshold=65536`, `sample_count=1024`, `event_id?`
+- **功能**: 在纹理中搜索满足条件的像素，支持：
+  - **内置过滤器**（`filters` dict）：`min_r/max_r/min_g/...`（float 范围）、`bitmask_r/...`（uint 位掩码 AND）、`bitmask_value_r/...`（掩码期望值，省略则匹配非零）、`has_nan/has_inf/has_negative`（异常检测）
+  - **自定义表达式**（`expression` str，最长500字符）：Python 表达式，变量 `r,g,b,a`（float）、`ri,gi,bi,ai`（uint）、`si_r,si_g,si_b,si_a`（sint）、`math`。支持位操作 `& | ^ ~ << >>`。例：`"(ri >> 24) & 0xFF == 128"`
+  - **切片范围搜索**：`array_slice` + `array_slice_end` 指定搜索的 slice 闭区间，适用于 3D 纹理/数组纹理/cubemap
+- **自适应搜索策略**（按单切片像素数判断）：
+  - `≤ full_scan_threshold`（默认 65536）：全量逐像素扫描
+  - `> full_scan_threshold`：两阶段搜索（Phase 1 均匀网格采样 `sample_count` 个点，Phase 2 对命中单元精确扫描）
+- **返回**: 匹配像素列表（含 x/y/slice/value/data_type）、search_mode、pixels_scanned、stopped_early、slices_searched
+- **限制**: max_results 上限 500，sample_count 上限 4096
+- **RenderDoc API**: `controller.PickPixel(tex_id, x, y, Subresource(mip, slice, 0), CompType.Typeless)`，格式化复用 `data_tools._format_pixel_value()`
 
 ### debug_shader_at_pixel
 - **参数**: `event_id`, `pixel_x`, `pixel_y`, `stage="pixel"`, `mode="summary"`, `watch_variables?`, `run_to_step?`, `run_to_line?`

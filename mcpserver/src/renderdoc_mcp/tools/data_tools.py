@@ -17,10 +17,97 @@ from renderdoc_mcp.util import (
     SHADER_STAGE_MAP,
     MESH_DATA_STAGE_MAP,
     TOPOLOGY_MAP,
+    TEXTURE_DIM_MAP,
 )
 
 
 MAX_BUFFER_READ = 65536  # 64 KB limit
+
+
+# ---------------------------------------------------------------------------
+# Pixel value formatting helper (used by pick_pixel and advanced_tools.find_pixels)
+# ---------------------------------------------------------------------------
+
+# CompType enum values (from renderdoc/api/replay/replay_enums.h)
+_COMP_TYPE_FLOAT_LIKE = {0, 1, 2, 3, 6, 7, 8, 9}  # Typeless, Float, UNorm, SNorm, UScaled, SScaled, Depth, UNormSRGB
+_COMP_TYPE_UINT = {4}  # UInt
+_COMP_TYPE_SINT = {5}  # SInt
+
+_CHANNEL_NAMES = ["r", "g", "b", "a"]
+_DEPTH_CHANNEL_NAMES_1 = ["depth"]
+_DEPTH_CHANNEL_NAMES_2 = ["depth", "stencil"]
+
+
+def _format_pixel_value(val, tex_desc) -> dict:
+    """Extract pixel channels and data type from a PixelValue based on texture format.
+
+    Args:
+        val: PixelValue object from PickPixel.
+        tex_desc: TextureDescription object (may be None; falls back to full float4).
+
+    Returns:
+        dict with "value", "data_type", "format_name", "raw".
+    """
+    raw = {
+        "float": [val.floatValue[i] for i in range(4)],
+        "uint": [val.uintValue[i] for i in range(4)],
+        "int": [val.intValue[i] for i in range(4)],
+    }
+
+    if tex_desc is None:
+        return {
+            "value": {ch: val.floatValue[i] for i, ch in enumerate(_CHANNEL_NAMES)},
+            "data_type": "float",
+            "format_name": "unknown",
+            "raw": raw,
+        }
+
+    fmt = tex_desc.format
+    format_name = str(fmt.Name())
+
+    # Special / compressed formats: PickPixel already decompresses to float4
+    if fmt.Special():
+        return {
+            "value": {ch: val.floatValue[i] for i, ch in enumerate(_CHANNEL_NAMES)},
+            "data_type": "float",
+            "format_name": format_name,
+            "raw": raw,
+        }
+
+    comp_type_val = int(fmt.compType)
+    comp_count = int(fmt.compCount) if fmt.compCount > 0 else 4
+    is_depth = (comp_type_val == 8)  # CompType.Depth
+
+    # Determine accessor and data type label
+    if comp_type_val in _COMP_TYPE_SINT:
+        accessor = lambda i: val.intValue[i]
+        data_type = "sint"
+    elif comp_type_val in _COMP_TYPE_UINT:
+        accessor = lambda i: val.uintValue[i]
+        data_type = "uint"
+    else:
+        accessor = lambda i: val.floatValue[i]
+        data_type = "float"
+
+    # Channel names
+    if is_depth:
+        if comp_count >= 2:
+            ch_names = _DEPTH_CHANNEL_NAMES_2
+        else:
+            ch_names = _DEPTH_CHANNEL_NAMES_1
+    else:
+        ch_names = _CHANNEL_NAMES[:comp_count]
+
+    value = {}
+    for i, ch in enumerate(ch_names):
+        value[ch] = accessor(i)
+
+    return {
+        "value": value,
+        "data_type": data_type,
+        "format_name": format_name,
+        "raw": raw,
+    }
 
 
 def register(mcp: FastMCP):
@@ -133,14 +220,25 @@ def register(mcp: FastMCP):
         resource_id: str,
         x: int,
         y: int,
+        mip_level: int = 0,
+        array_slice: int = 0,
+        sample_index: int = 0,
         event_id: Optional[int] = None,
     ) -> str:
-        """Get the RGBA value of a specific pixel in a texture.
+        """Get the value of a specific pixel in a texture.
+
+        Returns pixel data formatted according to the texture's actual format
+        (float/uint/sint, correct channel count). Also includes texture metadata
+        and raw values in all representations.
 
         Args:
             resource_id: The texture resource ID string.
             x: X coordinate of the pixel.
             y: Y coordinate of the pixel.
+            mip_level: Mip level to read (default 0).
+            array_slice: Array slice, 3D texture depth slice, or cubemap face index (default 0).
+                         Cubemap face order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
+            sample_index: MSAA sample index (default 0).
             event_id: Optional event ID to navigate to first.
         """
         session = get_session()
@@ -155,26 +253,82 @@ def register(mcp: FastMCP):
         if tex_id is None:
             return to_json(make_error(f"Texture resource '{resource_id}' not found", "INVALID_RESOURCE_ID"))
 
-        # PickPixel returns a PixelValue
-        val = session.controller.PickPixel(tex_id, x, y, rd.Subresource(0, 0, 0), rd.CompType.Typeless)
+        tex_desc = session.get_texture_desc(resource_id)
 
-        return to_json({
+        # --- Parameter validation ---
+        if tex_desc is not None:
+            # Mip level
+            if mip_level < 0 or mip_level >= tex_desc.mips:
+                return to_json(make_error(
+                    f"mip_level {mip_level} out of range [0, {tex_desc.mips - 1}]",
+                    "INVALID_PARAMETER",
+                ))
+            # Effective dimensions at this mip
+            eff_w = max(1, tex_desc.width >> mip_level)
+            eff_h = max(1, tex_desc.height >> mip_level)
+            if x < 0 or x >= eff_w:
+                return to_json(make_error(
+                    f"x={x} out of range [0, {eff_w - 1}] at mip {mip_level}",
+                    "INVALID_PARAMETER",
+                ))
+            if y < 0 or y >= eff_h:
+                return to_json(make_error(
+                    f"y={y} out of range [0, {eff_h - 1}] at mip {mip_level}",
+                    "INVALID_PARAMETER",
+                ))
+            # Array slice / depth slice
+            max_slice = max(tex_desc.arraysize, tex_desc.depth) - 1
+            if max_slice < 0:
+                max_slice = 0
+            if array_slice < 0 or array_slice > max_slice:
+                return to_json(make_error(
+                    f"array_slice {array_slice} out of range [0, {max_slice}]",
+                    "INVALID_PARAMETER",
+                ))
+            # MSAA sample
+            max_sample = max(tex_desc.msSamp, 1) - 1
+            if sample_index < 0 or sample_index > max_sample:
+                return to_json(make_error(
+                    f"sample_index {sample_index} out of range [0, {max_sample}]",
+                    "INVALID_PARAMETER",
+                ))
+
+        # --- Pick pixel ---
+        sub = rd.Subresource(mip_level, array_slice, sample_index)
+        val = session.controller.PickPixel(tex_id, x, y, sub, rd.CompType.Typeless)
+
+        # --- Format pixel value ---
+        formatted = _format_pixel_value(val, tex_desc)
+
+        result: dict = {
             "resource_id": resource_id,
             "x": x,
             "y": y,
-            "rgba": {
-                "r": val.floatValue[0],
-                "g": val.floatValue[1],
-                "b": val.floatValue[2],
-                "a": val.floatValue[3],
-            },
-            "rgba_uint": {
-                "r": val.uintValue[0],
-                "g": val.uintValue[1],
-                "b": val.uintValue[2],
-                "a": val.uintValue[3],
-            },
-        })
+            "mip_level": mip_level,
+            "array_slice": array_slice,
+            "sample_index": sample_index,
+            "value": formatted["value"],
+            "data_type": formatted["data_type"],
+            "format_name": formatted["format_name"],
+            "raw": formatted["raw"],
+        }
+
+        # --- Texture metadata ---
+        if tex_desc is not None:
+            result["texture_info"] = {
+                "name": tex_desc.name if hasattr(tex_desc, "name") else "",
+                "width": tex_desc.width,
+                "height": tex_desc.height,
+                "depth": tex_desc.depth,
+                "array_size": tex_desc.arraysize,
+                "mips": tex_desc.mips,
+                "format": str(tex_desc.format.Name()),
+                "dimension": enum_str(tex_desc.dimension, TEXTURE_DIM_MAP, "Dim."),
+                "cubemap": getattr(tex_desc, "cubemap", False),
+                "ms_samples": tex_desc.msSamp,
+            }
+
+        return to_json(result)
 
     @mcp.tool()
     def get_texture_stats(

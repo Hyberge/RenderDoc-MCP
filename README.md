@@ -7,8 +7,8 @@
 ## 特性
 
 - **完全独立运行** —— 自带从源码编译的 `renderdoc.pyd`，**不依赖也不干扰**系统中已安装的 RenderDoc。你可以同时使用系统的 RenderDoc GUI 进行日常调试，两者互不影响
-- **53 个工具**，覆盖完整的 RenderDoc 分析流程，按"从总体到细节"五层设计，契合 AI 分析模式
-- **10 个高级工具**，一次调用即可完成分析（Draw Call 状态、帧概览、对比、批量导出、像素区域采样等）
+- **54 个工具**，覆盖完整的 RenderDoc 分析流程，按"从总体到细节"五层设计，契合 AI 分析模式
+- **11 个高级工具**，一次调用即可完成分析（Draw Call 状态、帧概览、对比、批量导出、像素区域采样、像素条件搜索等）
 - **7 个检查工具**，提供帧级诊断总览、API 属性查询、调试消息获取、描述符访问，以及缓存消息分页查询
 - **统一超时保护** —— 每个 tool 默认带超时报错机制，避免长时间卡死无响应
 - **超长结果自动缓存** —— 输出过大时自动返回 `message_id`，再通过 `get_cached_message` 分页或搜索
@@ -266,7 +266,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 |------|------|
 | `save_texture` | 导出为 PNG、JPG、BMP、TGA、HDR、EXR 或 DDS |
 | `get_buffer_data` | 读取缓冲区数据（十六进制或 float32 数组） |
-| `pick_pixel` | 获取指定坐标的 RGBA 值 |
+| `pick_pixel` | 获取指定坐标的像素值（支持 mip/array_slice/MSAA，根据纹理格式智能返回通道和数据类型） |
 | `get_texture_stats` | 每通道最小/最大/平均值，带异常检测（NaN/Inf/负值） |
 | `read_texture_pixels` | 读取矩形像素区域（最大 64x64） |
 | `export_draw_textures` | 批量导出 Draw Call 绑定的所有纹理 |
@@ -282,7 +282,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `get_shader_reflection` | 输入/输出签名、资源绑定布局 |
 | `get_cbuffer_contents` | 常量缓冲区变量的实际值，支持 `filter` 按名称筛选 |
 
-### 高级功能（9 个）
+### 高级功能（10 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -292,6 +292,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `analyze_render_passes` | 自动检测渲染 Pass 边界 |
 | `search_passes` | **新增** 按 RT 格式/尺寸/数量、名称、draw count、相邻 pass 格式、管线状态（depth/stencil/shader）多维模糊搜索渲染 Pass |
 | `sample_pixel_region` | 均匀网格采样 RT 区域 —— 检测 NaN/Inf/负值/过曝 |
+| `find_pixels` | **新增** 按条件搜索匹配像素（min/max/bitmask/NaN/Inf/负值 + 自定义 Python 表达式，支持位操作），支持 `array_slice`/`array_slice_end` 跨切片范围搜索，自适应全量/两阶段搜索 |
 | `debug_shader_at_pixel` | 逐像素 Shader 调试，返回变量追踪信息 |
 | `debug_vertex` | **新增** 顶点着色器调试，追踪顶点变换/蒙皮问题 |
 | `debug_compute_thread` | **新增** Compute Shader 线程调试 |
@@ -348,7 +349,7 @@ renderdoc-mcp/
 │   │   ├── session.py          # 捕获生命周期，资源缓存
 │   │   ├── runtime.py          # 统一超时守卫、大结果缓存、分页查询
 │   │   ├── util.py             # 序列化，枚举映射，模块加载器
-│   │   └── tools/              # 10 个工具模块（共 53 个工具）
+│   │   └── tools/              # 10 个工具模块（共 54 个工具）
 
 │   ├── tests/
 │   └── pyproject.toml
