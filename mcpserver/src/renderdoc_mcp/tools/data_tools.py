@@ -170,17 +170,29 @@ def register(mcp: FastMCP):
         offset: int = 0,
         length: int = 256,
         format: str = "hex",
+        event_id: Optional[int] = None,
     ) -> str:
         """Read raw data from a buffer resource.
 
+        Automatically detects sub-range bindings: if the buffer is bound as a
+        sub-segment of a larger buffer (e.g. D3D12 Root CBV / Descriptor Table
+        with a non-zero byteOffset), the binding offset is added to `offset`
+        so the read starts at the data the shader actually sees.
+
         Args:
             resource_id: The buffer resource ID string.
-            offset: Byte offset to start reading from (default 0).
+            offset: Byte offset to start reading from within the bound sub-range (default 0).
             length: Number of bytes to read (default 256, max 65536).
             format: Output format: "hex" for hex dump, "floats" to interpret as float32 array.
+            event_id: Optional event ID to navigate to first. Required for sub-range
+                      detection (pipeline state is inspected at this event).
         """
         session = get_session()
         err = session.require_open()
+        if err:
+            return to_json(err)
+
+        err = session.ensure_event(event_id)
         if err:
             return to_json(err)
 
@@ -188,14 +200,95 @@ def register(mcp: FastMCP):
         if buf_id is None:
             return to_json(make_error(f"Buffer resource '{resource_id}' not found", "INVALID_RESOURCE_ID"))
 
+        # --- Auto-detect sub-range binding offset ---
+        # Scan all shader stages for a CBV/UAV/SRV binding of this buffer
+        # and collect the byteOffset from the descriptor.
+        binding_offset = 0
+        binding_info: dict | None = None
+        try:
+            state = session.controller.GetPipelineState()
+            stages = [
+                rd.ShaderStage.Vertex, rd.ShaderStage.Hull, rd.ShaderStage.Domain,
+                rd.ShaderStage.Geometry, rd.ShaderStage.Pixel, rd.ShaderStage.Compute,
+            ]
+            for stage in stages:
+                try:
+                    # Check constant buffers
+                    cbs = state.GetConstantBlocks(stage)
+                    for cb in cbs:
+                        for bind in cb.binds:
+                            if str(bind.descriptor.resource) == resource_id:
+                                bo = int(bind.descriptor.byteOffset)
+                                if bo > 0:
+                                    binding_offset = bo
+                                    binding_info = {
+                                        "stage": str(stage).replace("ShaderStage.", ""),
+                                        "type": "CBV",
+                                        "byteOffset": bo,
+                                        "byteSize": int(bind.descriptor.byteSize),
+                                    }
+                                break
+                        if binding_info:
+                            break
+
+                    if binding_info:
+                        break
+
+                    # Check read-only resources (SRV)
+                    ros = state.GetReadOnlyResources(stage)
+                    for ro in ros:
+                        if str(ro.descriptor.resource) == resource_id:
+                            bo = int(ro.descriptor.byteOffset)
+                            if bo > 0:
+                                binding_offset = bo
+                                binding_info = {
+                                    "stage": str(stage).replace("ShaderStage.", ""),
+                                    "type": "SRV",
+                                    "byteOffset": bo,
+                                    "byteSize": int(ro.descriptor.byteSize),
+                                }
+                            break
+
+                    if binding_info:
+                        break
+
+                    # Check read-write resources (UAV)
+                    rws = state.GetReadWriteResources(stage)
+                    for rw in rws:
+                        if str(rw.descriptor.resource) == resource_id:
+                            bo = int(rw.descriptor.byteOffset)
+                            if bo > 0:
+                                binding_offset = bo
+                                binding_info = {
+                                    "stage": str(stage).replace("ShaderStage.", ""),
+                                    "type": "UAV",
+                                    "byteOffset": bo,
+                                    "byteSize": int(rw.descriptor.byteSize),
+                                }
+                            break
+
+                    if binding_info:
+                        break
+
+                except Exception:
+                    continue
+        except Exception:
+            pass  # Pipeline state unavailable; fall back to user-provided offset
+
+        absolute_offset = binding_offset + offset
         length = min(length, MAX_BUFFER_READ)
-        data = session.controller.GetBufferData(buf_id, offset, length)
+        data = session.controller.GetBufferData(buf_id, absolute_offset, length)
 
         result: dict = {
             "resource_id": resource_id,
             "offset": offset,
+            "absolute_offset": absolute_offset,
             "bytes_read": len(data),
         }
+        if binding_info:
+            result["binding"] = binding_info
+        elif binding_offset == 0:
+            result["binding_note"] = "no sub-range binding detected; reading from absolute offset"
 
         if format == "floats":
             import struct

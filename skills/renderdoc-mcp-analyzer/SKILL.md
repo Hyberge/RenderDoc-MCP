@@ -108,6 +108,7 @@ For depth/rasterizer state, use `_get_depth_state(state)` and `_get_rasterizer_s
 - `FrameStatistics.recorded` is only `True` for D3D11 captures; D3D12/Vulkan/GL don't collect frame statistics
 - SWIG sub-objects (e.g. `DrawcallStats`, `DispatchStats`) are not JSON-serializable — extract their numeric attributes manually
 - `GetCBufferVariableContents()` requires correct `byteOffset` and `byteSize` from `cb_bind.descriptor.byteOffset/byteSize`. Passing `0, 0` causes all-zero reads on D3D12 because cbuffers are typically bound at non-zero offsets within a large buffer (via Root CBV / Descriptor Table). This matches RenderDoc GUI behavior in `BufferViewer.cpp:3745`
+- **`get_buffer_data` automatically handles sub-range bindings**: when `event_id` is provided, the tool scans all shader stage CBV/SRV/UAV bindings for the given resource and adds the `descriptor.byteOffset` to the user-supplied `offset`, so the read starts at what the shader actually sees. Returns `absolute_offset` and `binding` info in the result.
 - **Shader debugging** (`DebugPixel`/`DebugVertex`/`DebugThread`):
   - Returns a `ShaderDebugTrace` with `.debugger` handle — NOT pre-populated states
   - Must call `controller.ContinueDebug(trace.debugger)` in a loop to collect `ShaderDebugState` objects; returns empty list when done

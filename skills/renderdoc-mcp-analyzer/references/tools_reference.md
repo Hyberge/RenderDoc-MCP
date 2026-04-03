@@ -136,8 +136,10 @@
 - **RenderDoc API**: `controller.SaveTexture(texsave, path)`
 
 ### get_buffer_data
-- **参数**: `resource_id`, `offset=0`, `length=256`, `format="hex"/"floats"`
+- **参数**: `resource_id`, `offset=0`, `length=256`, `format="hex"/"floats"`, `event_id?`
 - **限制**: 最大 64KB
+- **子段自动检测**: 提供 `event_id` 时，自动扫描当前 pipeline state 中所有 stage（VS/HS/DS/GS/PS/CS）的 CBV/SRV/UAV 绑定，若该 buffer 以非零 `byteOffset` 绑定为子段（如 D3D12 Root CBV / Descriptor Table），则将 `byteOffset` 叠加到用户传入的 `offset` 上，使读取起点对准 shader 实际看到的数据
+- **返回额外字段**: `absolute_offset`（实际读取偏移）、`binding`（检测到子段时含 stage/type/byteOffset/byteSize）
 
 ### pick_pixel
 - **参数**: `resource_id`, `x`, `y`, `mip_level=0`, `array_slice=0`, `sample_index=0`, `raw_hex=False`, `event_id?`

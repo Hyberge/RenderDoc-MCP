@@ -265,7 +265,7 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | 工具 | 说明 |
 |------|------|
 | `save_texture` | 导出为 PNG、JPG、BMP、TGA、HDR、EXR 或 DDS |
-| `get_buffer_data` | 读取缓冲区数据（十六进制或 float32 数组） |
+| `get_buffer_data` | 读取缓冲区数据（十六进制或 float32 数组），自动检测 D3D12 子段绑定偏移 |
 | `pick_pixel` | 获取指定坐标的像素值（支持 mip/array_slice/MSAA，根据纹理格式智能返回通道和数据类型） |
 | `get_texture_stats` | 每通道最小/最大/平均值，带异常检测（NaN/Inf/负值） |
 | `read_texture_pixels` | 读取矩形像素区域（最大 64x64） |
