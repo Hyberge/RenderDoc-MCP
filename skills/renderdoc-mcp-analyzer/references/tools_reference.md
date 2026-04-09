@@ -50,6 +50,7 @@
 ### list_actions
 - **参数**: `max_depth=2`, `filter_flags`, `filter`（名称子串）, `event_type`（draw/dispatch/clear/copy/resolve）
 - **功能**: 列出 action 树，支持多种过滤。event_type 优先级高于 filter_flags
+- **filter 深度搜索**: 有 filter/filter_flags/event_type 时，递归搜索**所有深度**（不受 max_depth 限制），但超过 max_depth 的匹配节点以 `matched_children_count` + `matched_children`（平铺列表）方式展示而非展开
 - **返回**: actions 数组 + total 数量
 
 ### get_action
@@ -65,6 +66,9 @@
 ### search_actions
 - **参数**: `name_pattern`（正则）, `flags`（ActionFlags 名称列表）
 - **功能**: 按名称正则和/或 flags 搜索所有 actions
+- **新增 action_type 分类**: 每个结果携带 `action_type` 字段（`"draw"`/`"dispatch"`/`"clear"`/`"copy"`/`"resolve"`/`"marker"`/`"other"`）
+- **marker 子节点 EID**: `action_type="marker"` 的结果会附加 `child_execution_eids` 列表（含每个子 draw/dispatch/clear 的 `event_id` 和 `type`），避免误用 marker EID 做 debug/dispatch 操作
+- **常见陷阱**: 搜索 shader/pass 名时可能命中 debug marker，应读 `action_type` 并用 `child_execution_eids` 中的实际 dispatch/draw EID
 
 ### find_draws
 - **参数**: `blend`, `min_vertices`, `texture_id`, `shader_id`, `render_target_id`, `max_results=50`
@@ -136,10 +140,16 @@
 - **RenderDoc API**: `controller.SaveTexture(texsave, path)`
 
 ### get_buffer_data
-- **参数**: `resource_id`, `offset=0`, `length=256`, `format="hex"/"floats"`, `event_id?`
+- **参数**: `resource_id`, `offset=0`, `length=256`, `format="hex"/"floats"/"uint"/"auto"`, `event_id?`
 - **限制**: 最大 64KB
+- **format 选项**:
+  - `"hex"`: 十六进制转储（默认）
+  - `"floats"`: 解析为 float32 数组
+  - `"uint"`: 解析为 uint32 数组（适合存储 uint/count/index 的 UAV buffer）
+  - `"auto"`: 自动推断 — 扫描 shader 反射中的资源名称判断类型（名称含 uint/int → uint，含 float → floats，CBV → floats），无法推断时返回 hex + uint + float 三种并存解读
+- **常见陷阱**: `format="floats"` 读 uint buffer 时全部得到 0（因为 uint 0x3B9ACA00 = float 0.005）— 应使用 `format="uint"` 或 `format="auto"`
 - **子段自动检测**: 提供 `event_id` 时，自动扫描当前 pipeline state 中所有 stage（VS/HS/DS/GS/PS/CS）的 CBV/SRV/UAV 绑定，若该 buffer 以非零 `byteOffset` 绑定为子段（如 D3D12 Root CBV / Descriptor Table），则将 `byteOffset` 叠加到用户传入的 `offset` 上，使读取起点对准 shader 实际看到的数据
-- **返回额外字段**: `absolute_offset`（实际读取偏移）、`binding`（检测到子段时含 stage/type/byteOffset/byteSize）
+- **返回额外字段**: `absolute_offset`（实际读取偏移）、`binding`（检测到子段时含 stage/type/byteOffset/byteSize）、`format_note`（auto 模式的推断说明）
 
 ### pick_pixel
 - **参数**: `resource_id`, `x`, `y`, `mip_level=0`, `array_slice=0`, `sample_index=0`, `raw_hex=False`, `event_id?`
@@ -220,10 +230,13 @@
 ### debug_shader_at_pixel
 - **参数**: `event_id`, `pixel_x`, `pixel_y`, `stage="pixel"`, `mode="summary"`, `watch_variables?`, `run_to_step?`, `run_to_line?`
 - **功能**: 在指定像素执行 shader 调试，支持 4 种模式：
-  - `summary`（默认）: 紧凑概览——inputs/outputs/anomalies/call chain
-  - `watch`: 追踪指定变量的值变化历史
+  - `summary`（默认）: 紧凑概览——inputs/outputs/anomalies/call chain；`final_visible_variables` 包含每个源码变量的**实际运行时值**（对应 GUI High-level Variables 面板）
+  - `watch`: 追踪指定变量的值变化历史；额外返回 `not_found_variables`（未找到的变量名列表）和 `available_variables`（当前帧末可用的所有源码变量名，供参考）
   - `anomaly`: 定位第一个 NaN/Inf 出现的步骤和上下文
-  - `step`: 运行到指定步骤/源码行，显示所有可见源码变量
+  - `step`: 运行到指定步骤/源码行；`visible_source_variables` 包含每个源码变量的**实际运行时值**；额外返回 `execution_context`（前后各 5 步的 `{step, instruction, line}` 序列）和可能的 `compiler_reorder_warning`（检测到行号非线性跳转时出现）
+- **变量值解析机制**: 复刻 GUI `GetDebugVariable()`，根据 `DebugVariableReference.type` 分派到 6 个池（Variable→累积 changes 快照, Input→trace.inputs, Constant→trace.constantBlocks, ReadOnlyResource→trace.readOnlyResources, ReadWriteResource→trace.readWriteResources, Sampler→trace.samplers）；值以 `value` 字段返回，`status="undefined"` 表示未定义，`status="not_resolved"` 表示未找到对应调试变量
+- **watch 变量查找**: watch 模式只在变量**发生 change 时**记录，若变量存在但整个 trace 没有变化则不会出现在 history 中（可用 `available_variables` 查看实际可 watch 的变量）
+- **编译器重排警告**: `compiler_reorder_warning` 表示 DXIL 指令顺序不等于源码执行顺序，行号跳变是指令调度导致的，**不代表 branch taken**
 - **run_to_line 容错**: 若目标行被编译器优化掉，自动 snap 到最近可达行；若无可达行，返回 nearby_executed_lines 提示
 - **回退**: 调试不支持时返回像素值 + shader 信息 + 建议
 - **RenderDoc API**: `controller.DebugPixel(x, y, DebugPixelInputs())` → `ContinueDebug(trace.debugger)` 循环 → `FreeTrace(trace)`
@@ -367,13 +380,13 @@
 
 ### debug_vertex
 - **参数**: `event_id`, `vertex_id`, `instance_id=0`, `index=0`, `view=0`, `mode="summary"`, `watch_variables?`, `run_to_step?`, `run_to_line?`
-- **功能**: 顶点着色器调试，支持与 `debug_shader_at_pixel` 相同的 4 种模式（summary/watch/anomaly/step）
+- **功能**: 顶点着色器调试，支持与 `debug_shader_at_pixel` 相同的 4 种模式（summary/watch/anomaly/step），包含所有相同的增强：变量值解析（High-level Variables）、watch 的 not_found_variables/available_variables、step 的 execution_context 和 compiler_reorder_warning
 - **回退**: 调试不支持时返回 input/output signature + 建议
 - **RenderDoc API**: `controller.DebugVertex(vertid, instid, idx, view)` → `ContinueDebug` → `FreeTrace`
 
 ### debug_compute_thread
 - **参数**: `event_id`, `group_id=[0,0,0]`, `thread_id=[0,0,0]`, `mode="summary"`, `watch_variables?`, `run_to_step?`, `run_to_line?`
-- **功能**: Compute Shader 线程调试，支持与 `debug_shader_at_pixel` 相同的 4 种模式（summary/watch/anomaly/step）
+- **功能**: Compute Shader 线程调试，支持与 `debug_shader_at_pixel` 相同的 4 种模式（summary/watch/anomaly/step），包含所有相同的增强：变量值解析、watch 的 not_found_variables/available_variables、step 的 execution_context 和 compiler_reorder_warning
 - **回退**: 调试不支持时返回 constant_blocks + rw_resources + 建议
 - **RenderDoc API**: `controller.DebugThread(groupid, threadid)` → `ContinueDebug` → `FreeTrace`
 

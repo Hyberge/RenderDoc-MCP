@@ -107,17 +107,277 @@ def _collect_all_states(session, trace) -> list:
     return all_states
 
 
-def _get_visible_source_vars(inst_info, inst_src_map: dict, global_src_map: dict) -> list[dict]:
-    """Get all visible source-level variables at an instruction, with their current values
-    resolved through the debug variable mapping."""
+def _build_debug_var_snapshot(all_states, up_to_index: int) -> dict:
+    """Accumulate ShaderVariableChange to build debug_var_name → ShaderVariable snapshot.
+
+    Mirrors RenderDoc GUI's m_Variables maintained via applyForwardsChange().
+    Only covers DebugVariableType.Variable; other types (Input/Constant/etc.)
+    are static and read directly from trace.inputs/constantBlocks/etc.
+    """
+    snapshot: dict = {}
+    for i, st in enumerate(all_states):
+        if i > up_to_index:
+            break
+        for change in st.changes:
+            if change.after.name:
+                snapshot[change.after.name] = change.after
+            elif change.before.name:
+                # Variable going out of scope (after.name is empty)
+                snapshot.pop(change.before.name, None)
+    return snapshot
+
+
+def _find_debug_variable(name: str, pool):
+    """Find a ShaderVariable by dotted/indexed path in a variable pool.
+
+    Mirrors RenderDoc GUI's GetShaderDebugVariable(path, container).
+    Supports paths like 'View[0].member' by splitting on '.' and '['.
+    pool can be a list or dict of ShaderVariables.
+    """
+    if not name or pool is None:
+        return None
+
+    # Handle dict (snapshot) vs list (trace pools)
+    if isinstance(pool, dict):
+        # Direct lookup first (most common case for Variable type)
+        if name in pool:
+            return pool[name]
+        # Try path-based lookup for nested access
+        parts = name.replace("[", ".[").split(".")
+        current_name = parts[0]
+        if current_name not in pool:
+            return None
+        var = pool[current_name]
+        for part in parts[1:]:
+            if not var or not hasattr(var, "members"):
+                return None
+            found = False
+            for m in var.members:
+                if m.name == part or m.name == current_name + "." + part:
+                    var = m
+                    found = True
+                    break
+            if not found:
+                return None
+        return var
+
+    # List-based pool (trace.inputs, trace.constantBlocks, etc.)
+    try:
+        items = list(pool)
+    except Exception:
+        return None
+
+    if not items:
+        return None
+
+    # Split path: first element selects top-level var, rest navigate members
+    parts = name.replace("[", ".[").split(".")
+    elem = parts[0]
+
+    # Find top-level match
+    var = None
+    for item in items:
+        if item.name == elem:
+            var = item
+            break
+    if var is None:
+        return None
+
+    # Navigate remaining path through members
+    for part in parts[1:]:
+        if not var or not hasattr(var, "members") or not var.members:
+            return None
+        found = False
+        for m in var.members:
+            if m.name == part:
+                var = m
+                found = True
+                break
+        if not found:
+            return None
+    return var
+
+
+def _get_debug_variable(ref, trace, var_snapshot: dict):
+    """Resolve a DebugVariableReference to a ShaderVariable.
+
+    Mirrors RenderDoc GUI's ShaderViewer::GetDebugVariable().
+    Dispatches to 6 different pools based on ref.type.
+    """
+    try:
+        ref_type = int(ref.type)
+    except Exception:
+        return None
+
+    # DebugVariableType enum: 0=Undefined, 1=Input, 2=Constant, 3=ReadOnlyResource,
+    # 4=ReadWriteResource, 5=Sampler, 6=Variable
+    if ref_type == 6:  # Variable
+        return _find_debug_variable(ref.name, var_snapshot)
+    elif ref_type == 1:  # Input
+        return _find_debug_variable(ref.name, trace.inputs)
+    elif ref_type == 2:  # Constant
+        return _find_debug_variable(ref.name, trace.constantBlocks)
+    elif ref_type == 3:  # ReadOnlyResource
+        return _find_debug_variable(ref.name, trace.readOnlyResources)
+    elif ref_type == 4:  # ReadWriteResource
+        return _find_debug_variable(ref.name, trace.readWriteResources)
+    elif ref_type == 5:  # Sampler
+        return _find_debug_variable(ref.name, trace.samplers)
+    return None
+
+
+def _extract_component_value(var, component: int, var_type_int: int):
+    """Extract a single component value from a ShaderVariable using the correct accessor.
+
+    var_type_int is from SourceVariableMapping.type (VarType enum).
+    """
+    try:
+        # VarType: 0=Float, 1=Double, 2=Half, 3=SInt, 4=UInt, 5=SShort, 6=UShort,
+        # 7=SLong, 8=ULong, 9=SByte, 10=UByte, 11=Bool
+        if var_type_int == 1:  # Double
+            return var.value.f64v[component]
+        elif var_type_int in (3, 5, 7, 9):  # Signed int types
+            return var.value.s32v[component]
+        elif var_type_int in (4, 6, 8, 10):  # Unsigned int types
+            return var.value.u32v[component]
+        elif var_type_int == 11:  # Bool
+            return bool(var.value.u32v[component])
+        else:  # Float, Half, and all others
+            return var.value.f32v[component]
+    except Exception:
+        return None
+
+
+def _resolve_source_var_value(trace, var_snapshot: dict, svm) -> dict:
+    """Resolve a SourceVariableMapping to its runtime value.
+
+    Mirrors the value extraction logic in ShaderViewer::makeSourceVariableNode().
+    Returns a dict with name, type, rows, columns, value (and optional status/warning).
+    """
+    entry: dict = {"name": svm.name}
+
+    try:
+        var_type_int = int(svm.type)
+    except Exception:
+        var_type_int = 0
+
+    # Map VarType int to string
+    _VAR_TYPE_NAMES = {
+        0: "float", 1: "double", 2: "half", 3: "int", 4: "uint",
+        5: "short", 6: "ushort", 7: "long", 8: "ulong",
+        9: "byte", 10: "ubyte", 11: "bool",
+    }
+    entry["type"] = _VAR_TYPE_NAMES.get(var_type_int, "float")
+    entry["rows"] = svm.rows
+    entry["columns"] = svm.columns
+
+    if svm.undefinedValue:
+        entry["status"] = "undefined"
+        return entry
+
+    if svm.rows == 0 or svm.columns == 0:
+        return entry
+
+    # Collect values from all DebugVariableReferences
+    try:
+        refs = list(svm.variables)
+    except Exception:
+        entry["status"] = "no_refs"
+        return entry
+
+    if not refs:
+        entry["status"] = "no_refs"
+        return entry
+
+    # Check if any ref resolves (like GUI's hasNonError check)
+    any_resolved = False
+    for r in refs:
+        if _get_debug_variable(r, trace, var_snapshot) is not None:
+            any_resolved = True
+            break
+
+    if not any_resolved:
+        entry["status"] = "not_resolved"
+        return entry
+
+    # Handle complex types (struct/array) — if first ref resolves to a var with members
+    first_ref = refs[0]
+    first_var = _get_debug_variable(first_ref, trace, var_snapshot)
+    if first_var is not None and hasattr(first_var, "members") and first_var.members:
+        # Complex type: serialize the whole variable
+        entry["value"] = serialize_shader_variable(first_var).get("value")
+        members = serialize_shader_variable(first_var).get("members")
+        if members:
+            entry["members"] = members
+        return entry
+
+    # Simple scalar/vector/matrix: extract per-component values
+    values: list = []
+    has_warning = False
+    for r in refs:
+        var = _get_debug_variable(r, trace, var_snapshot)
+        if var is None:
+            values.append(None)
+            continue
+        val = _extract_component_value(var, r.component, var_type_int)
+        if val is not None and isinstance(val, float):
+            if math.isnan(val):
+                has_warning = True
+            elif math.isinf(val):
+                has_warning = True
+        values.append(val)
+
+    # Format as rows x columns
+    if svm.rows > 1 and len(values) >= svm.rows * svm.columns:
+        matrix = []
+        for row in range(svm.rows):
+            row_vals = values[row * svm.columns:(row + 1) * svm.columns]
+            matrix.append(row_vals)
+        entry["value"] = matrix
+    elif len(values) == 1:
+        entry["value"] = values[0]
+    else:
+        entry["value"] = values
+
+    if has_warning:
+        flat = [v for v in values if isinstance(v, (int, float))]
+        if any(isinstance(v, float) and math.isnan(v) for v in flat):
+            entry["warning"] = f"⚠️ {svm.name} contains NaN"
+        elif any(isinstance(v, float) and math.isinf(v) for v in flat):
+            entry["warning"] = f"⚠️ {svm.name} contains Inf"
+
+    return entry
+
+
+def _get_visible_source_vars(
+    inst_info,
+    inst_src_map: dict,
+    global_src_map: dict,
+    trace=None,
+    debug_var_snapshot: dict | None = None,
+) -> list[dict]:
+    """Get all visible source-level variables at an instruction with runtime values.
+
+    When trace and debug_var_snapshot are provided, resolves actual values through
+    the DebugVariableReference chain — matching RenderDoc GUI's High-level Variables panel.
+    Falls back to name-only output when trace is not available.
+    """
     if inst_info is None:
         return []
     result: list[dict] = []
     try:
         for svm in inst_info.sourceVars:
-            if not svm.name or svm.undefinedValue:
+            if not svm.name:
                 continue
-            result.append({"name": svm.name, "rows": svm.rows, "columns": svm.columns})
+            if svm.rows == 0 or svm.columns == 0:
+                continue
+            if trace is not None and debug_var_snapshot is not None:
+                entry = _resolve_source_var_value(trace, debug_var_snapshot, svm)
+            else:
+                entry = {"name": svm.name, "rows": svm.rows, "columns": svm.columns}
+                if svm.undefinedValue:
+                    entry["status"] = "undefined"
+            result.append(entry)
     except Exception:
         pass
     return result
@@ -159,6 +419,31 @@ def _serialize_change(change, inst_src_map: dict, global_src_map: dict) -> dict 
         elif any(math.isinf(v) for v in flat):
             sv["warning"] = f"⚠️ {display} contains Inf"
     return sv
+
+
+def _collect_available_vars(inst_entries, all_states, trace, global_src_map) -> list[str]:
+    """Collect all unique source variable names visible at the last state.
+
+    Combines global sourceVars (from trace) and local sourceVars (from last instruction).
+    Returns a sorted deduplicated list suitable for guiding watch variable selection.
+    """
+    names: set[str] = set()
+    try:
+        # Global source vars (lifetime of trace)
+        for svm in trace.sourceVars:
+            if svm.name and not svm.undefinedValue:
+                names.add(svm.name)
+        # Local source vars at last executed instruction
+        if all_states:
+            last_state = all_states[-1]
+            last_info = _find_inst_info(inst_entries, last_state.nextInstruction)
+            if last_info:
+                for svm in last_info.sourceVars:
+                    if svm.name and not svm.undefinedValue:
+                        names.add(svm.name)
+    except Exception:
+        pass
+    return sorted(names)[:100]  # Cap at 100 to avoid huge output
 
 
 def _run_shader_debug(
@@ -254,7 +539,14 @@ def _run_shader_debug(
             target_inst_info = _find_inst_info(inst_entries, instruction)
         inst_src_map = _get_inst_source_var_map(target_inst_info)
 
-        visible_vars = _get_visible_source_vars(target_inst_info, inst_src_map, global_src_map)
+        # Build variable snapshot up to target state for value resolution
+        target_idx = all_states.index(target_state)
+        var_snapshot = _build_debug_var_snapshot(all_states, target_idx)
+
+        visible_vars = _get_visible_source_vars(
+            target_inst_info, inst_src_map, global_src_map,
+            trace=trace, debug_var_snapshot=var_snapshot,
+        )
         location = _get_step_location(target_inst_info)
 
         result_dict: dict = {
@@ -268,6 +560,32 @@ def _run_shader_debug(
             },
             "visible_source_variables": visible_vars,
         }
+
+        # Execution context: collect nearby steps' source lines for path understanding
+        nearby_steps: list[dict] = []
+        context_range = 5
+        for i in range(max(0, target_idx - context_range), min(len(all_states), target_idx + context_range + 1)):
+            ctx_st = all_states[i]
+            ctx_info = _find_inst_info(inst_entries, ctx_st.nextInstruction)
+            ctx_loc = _get_step_location(ctx_info)
+            nearby_steps.append({
+                "step": ctx_st.stepIndex,
+                "instruction": ctx_st.nextInstruction,
+                "line": ctx_loc.get("line") if ctx_loc else None,
+            })
+        if nearby_steps:
+            result_dict["execution_context"] = nearby_steps
+            # Detect non-linear line jumps (compiler reordering)
+            lines = [s["line"] for s in nearby_steps if s["line"] is not None]
+            if len(lines) >= 2:
+                has_backward_jump = any(lines[i] > lines[i + 1] for i in range(len(lines) - 1))
+                if has_backward_jump:
+                    result_dict["compiler_reorder_warning"] = (
+                        "Non-linear source line progression detected in nearby steps. "
+                        "This is likely due to compiler instruction reordering (DXIL/SPIR-V optimization), "
+                        "NOT necessarily a branch decision. Do not assume control flow from line number order alone."
+                    )
+
         # Note if we had to snap to a different line
         if run_to_line is not None and location and location.get("line") != run_to_line:
             result_dict["note"] = (
@@ -372,6 +690,13 @@ def _run_shader_debug(
             "total_states": total_states,
             "watched_variables": {k: v for k, v in history.items()},
             "variables_found": len(history),
+            "not_found_variables": [
+                w for w in watch_variables
+                if not any(w.lower() in k.lower() for k in history)
+            ],
+            "available_variables": _collect_available_vars(
+                inst_entries, all_states, trace, global_src_map,
+            ),
         }
 
     # ── summary mode (default): compact overview ──
@@ -388,7 +713,12 @@ def _run_shader_debug(
     last_state = all_states[-1]
     last_inst_info = _find_inst_info(inst_entries, last_state.nextInstruction)
     last_src_map = _get_inst_source_var_map(last_inst_info)
-    final_visible = _get_visible_source_vars(last_inst_info, last_src_map, global_src_map)
+    # Build full variable snapshot for value resolution
+    full_snapshot = _build_debug_var_snapshot(all_states, len(all_states) - 1)
+    final_visible = _get_visible_source_vars(
+        last_inst_info, last_src_map, global_src_map,
+        trace=trace, debug_var_snapshot=full_snapshot,
+    )
 
     # Unique functions in callstack
     all_functions: list[str] = []

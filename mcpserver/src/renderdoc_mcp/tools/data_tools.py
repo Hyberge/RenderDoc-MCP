@@ -183,7 +183,8 @@ def register(mcp: FastMCP):
             resource_id: The buffer resource ID string.
             offset: Byte offset to start reading from within the bound sub-range (default 0).
             length: Number of bytes to read (default 256, max 65536).
-            format: Output format: "hex" for hex dump, "floats" to interpret as float32 array.
+            format: Output format: "hex" for hex dump, "floats" for float32 array,
+                    "uint" for uint32 array, "auto" to auto-detect from shader binding type.
             event_id: Optional event ID to navigate to first. Required for sub-range
                       detection (pipeline state is inspected at this event).
         """
@@ -296,6 +297,74 @@ def register(mcp: FastMCP):
             floats = list(struct.unpack_from(f"{num_floats}f", data))
             result["data"] = [round(f, 6) for f in floats]
             result["format"] = "float32"
+        elif format == "uint":
+            import struct
+            num_uints = len(data) // 4
+            uints = list(struct.unpack_from(f"{num_uints}I", data))
+            result["data"] = uints
+            result["format"] = "uint32"
+        elif format == "auto":
+            import struct
+            # Try to infer format from shader binding type
+            inferred = "hex"
+            infer_note = ""
+            if binding_info:
+                btype = binding_info.get("type", "")
+                if btype == "UAV":
+                    # Check shader reflection for resource type hint
+                    try:
+                        state = session.controller.GetPipelineState()
+                        for stage in [
+                            rd.ShaderStage.Vertex, rd.ShaderStage.Hull, rd.ShaderStage.Domain,
+                            rd.ShaderStage.Geometry, rd.ShaderStage.Pixel, rd.ShaderStage.Compute,
+                        ]:
+                            refl = state.GetShaderReflection(stage)
+                            if refl is None:
+                                continue
+                            for rw in refl.readWriteResources:
+                                rw_name_lower = rw.name.lower() if rw.name else ""
+                                if "uint" in rw_name_lower or "int" in rw_name_lower:
+                                    inferred = "uint"
+                                    infer_note = f"inferred uint from UAV resource name '{rw.name}'"
+                                    break
+                                elif "float" in rw_name_lower:
+                                    inferred = "floats"
+                                    infer_note = f"inferred float from UAV resource name '{rw.name}'"
+                                    break
+                            if inferred != "hex":
+                                break
+                    except Exception:
+                        pass
+                elif btype == "CBV":
+                    inferred = "floats"
+                    infer_note = "CBV buffers typically contain float data"
+
+            num_vals = len(data) // 4
+            if inferred == "uint":
+                uints = list(struct.unpack_from(f"{num_vals}I", data))
+                result["data"] = uints
+                result["format"] = "uint32"
+            elif inferred == "floats":
+                floats = list(struct.unpack_from(f"{num_vals}f", data))
+                result["data"] = [round(f, 6) for f in floats]
+                result["format"] = "float32"
+            else:
+                # Fallback: provide both interpretations
+                uints = list(struct.unpack_from(f"{num_vals}I", data))
+                floats = list(struct.unpack_from(f"{num_vals}f", data))
+                result["data_uint32"] = uints
+                result["data_float32"] = [round(f, 6) for f in floats]
+                # Also hex dump
+                lines = []
+                for i in range(0, len(data), 16):
+                    chunk = data[i:i+16]
+                    hex_part = " ".join(f"{b:02x}" for b in chunk)
+                    lines.append(f"{offset+i:08x}: {hex_part}")
+                result["data"] = "\n".join(lines)
+                result["format"] = "hex+uint+float"
+                infer_note = "could not infer type; providing all interpretations"
+            if infer_note:
+                result["format_note"] = infer_note
         else:
             # Hex dump - show lines of 16 bytes
             lines = []

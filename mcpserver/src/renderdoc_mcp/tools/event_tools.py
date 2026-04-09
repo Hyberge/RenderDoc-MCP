@@ -91,10 +91,33 @@ def register(mcp: FastMCP):
                 return False
             return True
 
+        def _collect_leaf_matches(node: dict) -> list[dict]:
+            """Flatten a nested filter result into a list of leaf-level matches."""
+            leaves = []
+            # If this node itself matches (included), it's a match entry
+            direct = {"event_id": node["event_id"], "name": node["name"]}
+            # Check if it has further children or matched_children
+            if "children" in node:
+                for ch in node["children"]:
+                    leaves.extend(_collect_leaf_matches(ch))
+            elif "matched_children" in node:
+                for ch in node["matched_children"]:
+                    # Recurse if the child has nested structure
+                    if "children" in ch or "matched_children" in ch:
+                        leaves.extend(_collect_leaf_matches(ch))
+                    else:
+                        leaves.append({"event_id": ch["event_id"], "name": ch["name"]})
+            else:
+                # Leaf node
+                leaves.append(direct)
+            return leaves
+
         def serialize_filtered(action, depth: int) -> dict | None:
             included = should_include(action)
             children = []
-            if depth < max_depth and len(action.children) > 0:
+            # When filtering, always recurse into children regardless of depth
+            # to find deep matches; only limit display expansion by max_depth
+            if len(action.children) > 0:
                 for c in action.children:
                     child = serialize_filtered(c, depth + 1)
                     if child is not None:
@@ -111,7 +134,15 @@ def register(mcp: FastMCP):
             if action.numIndices > 0:
                 result["num_indices"] = action.numIndices
             if children:
-                result["children"] = children
+                if depth < max_depth:
+                    result["children"] = children
+                else:
+                    # Beyond max_depth: flatten all matching descendants to a list
+                    flat: list[dict] = []
+                    for ch in children:
+                        flat.extend(_collect_leaf_matches(ch))
+                    result["matched_children_count"] = len(flat)
+                    result["matched_children"] = flat
             elif depth >= max_depth and len(action.children) > 0:
                 result["children_count"] = len(action.children)
             return result
@@ -208,11 +239,38 @@ def register(mcp: FastMCP):
             action_name = action.GetName(sf)
             if pattern and not pattern.search(action_name):
                 continue
-            results.append({
+            entry = {
                 "event_id": eid,
                 "name": action_name,
                 "flags": flags_to_list(action.flags),
-            })
+            }
+            # Classify action type
+            if action.flags & rd.ActionFlags.Drawcall:
+                entry["action_type"] = "draw"
+            elif action.flags & rd.ActionFlags.Dispatch:
+                entry["action_type"] = "dispatch"
+            elif action.flags & rd.ActionFlags.Clear:
+                entry["action_type"] = "clear"
+            elif action.flags & rd.ActionFlags.Copy:
+                entry["action_type"] = "copy"
+            elif action.flags & rd.ActionFlags.Resolve:
+                entry["action_type"] = "resolve"
+            elif len(action.children) > 0:
+                entry["action_type"] = "marker"
+                # Collect actual execution EIDs from children
+                child_eids: list[dict] = []
+                for c in action.children:
+                    if c.flags & rd.ActionFlags.Dispatch:
+                        child_eids.append({"event_id": c.eventId, "type": "dispatch"})
+                    elif c.flags & rd.ActionFlags.Drawcall:
+                        child_eids.append({"event_id": c.eventId, "type": "draw"})
+                    elif c.flags & rd.ActionFlags.Clear:
+                        child_eids.append({"event_id": c.eventId, "type": "clear"})
+                if child_eids:
+                    entry["child_execution_eids"] = child_eids
+            else:
+                entry["action_type"] = "other"
+            results.append(entry)
 
         return to_json({"matches": results, "count": len(results)})
 

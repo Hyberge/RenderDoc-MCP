@@ -108,16 +108,27 @@ For depth/rasterizer state, use `_get_depth_state(state)` and `_get_rasterizer_s
 - `FrameStatistics.recorded` is only `True` for D3D11 captures; D3D12/Vulkan/GL don't collect frame statistics
 - SWIG sub-objects (e.g. `DrawcallStats`, `DispatchStats`) are not JSON-serializable — extract their numeric attributes manually
 - `GetCBufferVariableContents()` requires correct `byteOffset` and `byteSize` from `cb_bind.descriptor.byteOffset/byteSize`. Passing `0, 0` causes all-zero reads on D3D12 because cbuffers are typically bound at non-zero offsets within a large buffer (via Root CBV / Descriptor Table). This matches RenderDoc GUI behavior in `BufferViewer.cpp:3745`
-- **`get_buffer_data` automatically handles sub-range bindings**: when `event_id` is provided, the tool scans all shader stage CBV/SRV/UAV bindings for the given resource and adds the `descriptor.byteOffset` to the user-supplied `offset`, so the read starts at what the shader actually sees. Returns `absolute_offset` and `binding` info in the result.
+- **`get_buffer_data` automatically handles sub-range bindings**: when `event_id` is provided, the tool scans all shader stage CBV/SRV/UAV bindings for the given resource and adds the `descriptor.byteOffset` to the user-supplied `offset`, so the read starts at what the shader actually sees. Returns `absolute_offset` and `binding` info in the result. **NEW**: supports `format="uint"` (uint32 array) and `format="auto"` (infer from shader reflection resource names); use `"uint"` for UAV buffers storing counts/indices — `"floats"` will return all zeros for uint data.
 - **Shader debugging** (`DebugPixel`/`DebugVertex`/`DebugThread`):
   - Returns a `ShaderDebugTrace` with `.debugger` handle — NOT pre-populated states
   - Must call `controller.ContinueDebug(trace.debugger)` in a loop to collect `ShaderDebugState` objects; returns empty list when done
   - Each `ShaderDebugState` has `.changes` (list of `ShaderVariableChange`), NOT `.locals` or `.states`
   - `ShaderVariableChange.after` gives the `ShaderVariable` with new value
   - Must call `controller.FreeTrace(trace)` when done to release debugger resources
-  - Source variable mapping: `trace.sourceVars` (global) and `trace.instInfo[].sourceVars` (per-instruction) map debug register names to HLSL variable names
+  - Source variable mapping: `trace.sourceVars` (global) and `trace.instInfo[].sourceVars` (per-instruction) map debug register names to HLSL variable names via `SourceVariableMapping`
   - `trace.instInfo` entries have `.lineInfo` (fileIndex, lineStart, lineEnd) for source location mapping
   - Lines may be optimized out by the compiler — use nearest reachable line fallback
+  - **Variable value resolution** (mirrors GUI `GetDebugVariable()`): each `SourceVariableMapping.variables` contains `DebugVariableReference` entries; resolve by dispatching on `ref.type` (int):
+    - `6 = Variable` → look up in `_build_debug_var_snapshot()` (accumulated from `ShaderDebugState.changes` up to current step)
+    - `1 = Input` → `trace.inputs`
+    - `2 = Constant` → `trace.constantBlocks`
+    - `3 = ReadOnlyResource` → `trace.readOnlyResources`
+    - `4 = ReadWriteResource` → `trace.readWriteResources`
+    - `5 = Sampler` → `trace.samplers`
+    - Then extract specific component with `ref.component` and value type from `svm.type` (VarType: 0=float, 3=int, 4=uint, 11=bool, ...)
+  - `svm.undefinedValue == True` means the value has not been assigned yet at this point
+  - **In MCP**: `step` and `summary` modes now return actual runtime values for all source variables, matching the GUI "High-level Variables" panel. `watch` mode now includes `not_found_variables` (names not found in trace) and `available_variables` (all source var names at end of trace, for reference)
+  - **`execution_context`** in step mode: nearby ±5 steps with source line numbers. Non-linear line progression may appear due to compiler instruction scheduling (DXIL optimization) — this does NOT mean a branch was taken (`compiler_reorder_warning` field)
 - **Disassemble shader with HLSL**: `refl.debugInfo.files` contains HLSL source when shader PDB is loaded via `shader_debug_paths`. Check `len(debug_info.files) > 0` and use `f.contents` for source text
 - **Shader debug paths**: Must be set via `rd.SetConfigSetting("DXBC.Debug.SearchDirPaths")` **before** `cap.OpenCapture()` because `DXBCContainer` loads debug info during construction
 
