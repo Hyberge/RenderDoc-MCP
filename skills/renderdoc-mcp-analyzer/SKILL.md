@@ -7,7 +7,7 @@ description: "This skill provides comprehensive knowledge for developing, extend
 
 ## Overview
 
-The RenderDoc MCP Server is a Python-based Model Context Protocol server enabling AI-assisted GPU frame capture analysis. It provides **55 tools** across 10 categories and **3 built-in prompt templates** for guided debugging workflows.
+The RenderDoc MCP Server is a Python-based Model Context Protocol server enabling AI-assisted GPU frame capture analysis. It provides **57 tools** across 10 categories and **3 built-in prompt templates** for guided debugging workflows.
 
 ### When to Use This Skill
 
@@ -23,19 +23,24 @@ The RenderDoc MCP Server is a Python-based Model Context Protocol server enablin
 ```
 AI Client ←—MCP (stdio)—→ FastMCP Server (server.py)
                               │
-                              ├── RenderDocSession (session.py) — singleton lifecycle manager
-                              │     ├── CaptureFile handle
-                              │     ├── ReplayController handle
-                              │     ├── action_map cache (eventId → ActionDescription)
-                              │     ├── event_map cache (eventId → chunkIndex, all API events)
-                              │     ├── resource_id_cache (str → ResourceId)
-                              │     └── texture_desc_cache (str → TextureDescription)
+                              ├── session.py — multi-capture registry
+                              │     ├── _sessions: dict[filepath, RenderDocSession]
+                              │     ├── _active_session_id: str | None
+                              │     ├── get_session() → active RenderDocSession | None
+                              │     ├── open_session() / switch_session() / close_session() / close_all_sessions()
+                              │     └── RenderDocSession (per-capture)
+                              │           ├── CaptureFile handle
+                              │           ├── ReplayController handle
+                              │           ├── action_map cache (eventId → ActionDescription)
+                              │           ├── event_map cache (eventId → chunkIndex, all API events)
+                              │           ├── resource_id_cache (str → ResourceId)
+                              │           └── texture_desc_cache (str → TextureDescription)
                               │
-                              ├── runtime.py — timeout guard, large-result cache, cached-message query
+                              ├── runtime.py — timeout guard, large-result cache, idle-watcher thread
                               ├── util.py — module loading, enum maps, serialization helpers
                               │
                               └── tools/ — 10 modules, each with register(mcp) pattern
-                                    ├── session_tools.py      (4 tools)
+                                    ├── session_tools.py      (6 tools: +list_captures, +switch_capture)
                                     ├── event_tools.py        (7 tools)
                                     ├── pipeline_tools.py     (4 tools)
                                     ├── resource_tools.py     (4 tools)
@@ -155,11 +160,25 @@ This avoids the slow MCP restart cycle and gives immediate feedback. Clean up th
 
 ### Session Lifecycle
 
+**Multi-capture registry** (session.py module level):
+
 ```
 open_capture(path)
-  → rd.InitialiseReplay() (first time only)
-  → rd.OpenCaptureFile() → cap.OpenFile() → cap.OpenCapture()
-  → Build action_map, event_map, resource_id_cache, texture_desc_cache
+  → _ensure_initialized(): rd.InitialiseReplay() once globally
+  → If filepath already in _sessions: activate it (idempotent)
+  → Else: new RenderDocSession → cap.OpenCapture()
+          → build action_map, event_map, resource_id_cache, texture_desc_cache
+          → register in _sessions[filepath], set _active_session_id = filepath
+
+get_session() → _sessions[_active_session_id] | None
+
+switch_capture(filepath) → _active_session_id = filepath
+
+list_captures() → list of all open sessions with is_active flag
+
+close_capture(filepath=None)
+  → close target or active session → controller.Shutdown(), cap.Shutdown()
+  → remove from _sessions, update _active_session_id to last remaining
 
 set_event(eid) / ensure_event(eid)
   → controller.SetFrameEvent(eid, True)
@@ -168,13 +187,31 @@ set_event(eid) / ensure_event(eid)
 Pipeline queries (after set_event):
   → controller.GetPipelineState() → state.Get*()
 
-close_capture()
-  → controller.Shutdown(), cap.Shutdown()
-  → Clear all caches
-
-shutdown() (atexit)
-  → close_capture() + rd.ShutdownReplay()
+shutdown_all() (atexit)
+  → close_all_sessions() + rd.ShutdownReplay()
 ```
+
+**Idle-timeout watcher** (runtime.py):
+
+```
+_last_activity_time updated on every tool call entry (wrap_tool_function)
+_IdleWatcher daemon thread: checks every 60s
+  → if monotonic() - _last_activity_time > IDLE_TIMEOUT_MINUTES * 60:
+      close_all_sessions()  # releases all cap+controller, does NOT ShutdownReplay
+
+RENDERDOC_MCP_IDLE_TIMEOUT_MINUTES env var (default: 10, 0 = disabled)
+```
+
+**Key rules for tools using sessions:**
+
+```python
+session = get_session()
+if session is None:
+    return to_json(make_error("No capture file is open. Use open_capture first.", "NO_CAPTURE_OPEN"))
+err = session.require_open()  # redundant but safe guard
+```
+
+Note: `get_session()` now returns `None` when no capture is active (previously always returned a session object). All tools in `session_tools.py` already handle this. Other tool modules call `session.require_open()` which handles the case where the session object exists but is not open — but they should also guard against `get_session()` returning `None`. In practice, `get_session()` is only `None` after `close_all_sessions()` or before any `open_capture` call.
 
 ### Adding a New Tool
 

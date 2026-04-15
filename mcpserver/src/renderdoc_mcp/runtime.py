@@ -20,6 +20,8 @@ MAX_DIRECT_RESPONSE_CHARS = max(2000, int(os.environ.get("RENDERDOC_MCP_MAX_RESP
 CACHE_MAX_ENTRIES = max(10, int(os.environ.get("RENDERDOC_MCP_CACHE_MAX_ENTRIES", "128")))
 CACHE_DEFAULT_PAGE_SIZE = max(1, int(os.environ.get("RENDERDOC_MCP_CACHE_DEFAULT_PAGE_SIZE", "50")))
 CACHE_MAX_PAGE_SIZE = max(CACHE_DEFAULT_PAGE_SIZE, int(os.environ.get("RENDERDOC_MCP_CACHE_MAX_PAGE_SIZE", "200")))
+# 0 = disabled; default 10 minutes
+IDLE_TIMEOUT_MINUTES = max(0, int(os.environ.get("RENDERDOC_MCP_IDLE_TIMEOUT_MINUTES", "10")))
 
 # Per-tool timeout overrides (tool_name -> timeout_ms)
 _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
@@ -100,6 +102,59 @@ _active_future: Future | None = None
 _active_tool_name: str | None = None
 _active_started_at: float | None = None
 
+# ── Idle-timeout tracking ──
+_last_activity_time: float = time.monotonic()
+_last_activity_lock = threading.Lock()
+_idle_watcher_started: bool = False
+_idle_watcher_stop: threading.Event = threading.Event()
+
+
+def update_last_activity() -> None:
+    """Record the current time as the most recent MCP tool activity."""
+    global _last_activity_time
+    with _last_activity_lock:
+        _last_activity_time = time.monotonic()
+
+
+class _IdleWatcher(threading.Thread):
+    """Daemon thread that closes all captures after a period of inactivity."""
+
+    _CHECK_INTERVAL_S = 60  # check every minute
+
+    def __init__(self, timeout_minutes: int, stop_event: threading.Event):
+        super().__init__(name="renderdoc-mcp-idle-watcher", daemon=True)
+        self._timeout_s = timeout_minutes * 60
+        self._stop = stop_event
+
+    def run(self):
+        while not self._stop.wait(timeout=self._CHECK_INTERVAL_S):
+            with _last_activity_lock:
+                idle_s = time.monotonic() - _last_activity_time
+            if idle_s >= self._timeout_s:
+                # Import here to avoid circular import at module load time
+                try:
+                    from renderdoc_mcp.session import close_all_sessions
+                    close_all_sessions()
+                except Exception:
+                    pass
+                # Reset timer so we don't close again immediately after
+                update_last_activity()
+
+
+def start_idle_watcher() -> None:
+    """Start the idle-watcher daemon thread (idempotent)."""
+    global _idle_watcher_started
+    if _idle_watcher_started or IDLE_TIMEOUT_MINUTES <= 0:
+        return
+    _idle_watcher_started = True
+    watcher = _IdleWatcher(IDLE_TIMEOUT_MINUTES, _idle_watcher_stop)
+    watcher.start()
+
+
+@atexit.register
+def _stop_idle_watcher():
+    _idle_watcher_stop.set()
+
 
 @atexit.register
 def _shutdown_runtime_executor():
@@ -120,6 +175,7 @@ def install_tool_runtime_guards(mcp) -> None:
 
     mcp.add_tool = guarded_add_tool
     mcp._renderdoc_runtime_installed = True
+    start_idle_watcher()
 
 
 def wrap_tool_function(fn: Callable[..., Any], tool_name: str) -> Callable[..., Any]:
@@ -130,6 +186,8 @@ def wrap_tool_function(fn: Callable[..., Any], tool_name: str) -> Callable[..., 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         global _active_future, _active_tool_name, _active_started_at
+
+        update_last_activity()
 
         with _tool_state_lock:
             if _active_future is not None and not _active_future.done():

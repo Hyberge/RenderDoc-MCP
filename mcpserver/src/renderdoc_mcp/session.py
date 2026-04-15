@@ -1,4 +1,4 @@
-"""RenderDoc session manager - singleton managing capture file lifecycle."""
+"""RenderDoc session manager - multi-capture registry with active session switching."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ class RenderDocSession:
     """Manages a single RenderDoc capture file's lifecycle."""
 
     def __init__(self):
-        self._initialized: bool = False
         self._cap = None  # CaptureFile
         self._controller = None  # ReplayController
         self._filepath: str | None = None
@@ -21,12 +20,6 @@ class RenderDocSession:
         self._structured_file = None
         self._resource_id_cache: dict[str, object] = {}  # str(resourceId) → resourceId
         self._texture_desc_cache: dict[str, object] = {}  # str(resourceId) → TextureDescription
-
-    def _ensure_initialized(self):
-        """Initialize the replay system if not already done."""
-        if not self._initialized:
-            rd.InitialiseReplay(rd.GlobalEnvironment(), [])
-            self._initialized = True
 
     @property
     def is_open(self) -> bool:
@@ -70,27 +63,18 @@ class RenderDocSession:
         return None
 
     def open(self, filepath: str, shader_debug_paths: list[str] | None = None) -> dict:
-        """Open a .rdc capture file. Closes any previously open capture.
+        """Open a .rdc capture file. Caller must ensure replay is initialized.
 
         Args:
             filepath: Absolute path to the .rdc file.
             shader_debug_paths: Optional list of directories to search for
                 separate shader debug info (PDB files). Must be set before
-                opening the capture. Matches RenderDoc GUI's
-                "Shader debug info search paths" setting.
+                opening the capture.
         """
-        self._ensure_initialized()
-
         if not os.path.isfile(filepath):
             return make_error(f"File not found: {filepath}", "API_ERROR")
 
-        # Close any existing capture
-        if self.is_open:
-            self.close()
-
         # Set shader debug info search paths before opening capture.
-        # This must happen before OpenCapture() because DXBCContainer loads
-        # debug info during construction (TryFetchSeparateDebugInfo).
         if shader_debug_paths:
             self._set_shader_debug_paths(shader_debug_paths)
 
@@ -174,12 +158,7 @@ class RenderDocSession:
                 self._build_event_map(a.children)
 
     def _set_shader_debug_paths(self, paths: list[str]):
-        """Configure shader debug info search paths via RenderDoc config system.
-
-        This sets the DXBC.Debug.SearchDirPaths config, matching RenderDoc GUI's
-        "Shader debug info search paths" dialog (SettingsDialog.cpp:673).
-        All paths are added as recursive search paths.
-        """
+        """Configure shader debug info search paths via RenderDoc config system."""
         try:
             paths_obj = rd.SetConfigSetting("DXBC.Debug.SearchDirPaths")
             if paths_obj is not None:
@@ -188,7 +167,6 @@ class RenderDocSession:
                     child = rd.makeSDString("$el", p)
                     paths_obj.AddChild(child)
         except Exception:
-            # If SetConfigSetting is not available in this build, silently skip
             pass
 
     def resolve_resource_id(self, resource_id_str: str):
@@ -227,8 +205,7 @@ class RenderDocSession:
         return None
 
     def ensure_event(self, event_id: int | None) -> dict | None:
-        """If event_id is given, set it. If no event is current, return error.
-        Returns error dict or None on success."""
+        """If event_id is given, set it. If no event is current, return error."""
         if event_id is not None:
             return self.set_event(event_id)
         if self._current_event is None:
@@ -242,22 +219,176 @@ class RenderDocSession:
     def get_root_actions(self):
         return self._controller.GetRootActions()
 
-    def shutdown(self):
-        """Full shutdown - close capture and deinitialize replay."""
-        if self.is_open:
-            self.close()
-        if self._initialized:
-            rd.ShutdownReplay()
-            self._initialized = False
+
+# ── Module-level multi-session registry ──
+
+_sessions: dict[str, RenderDocSession] = {}
+_active_session_id: str | None = None
+_replay_initialized: bool = False
 
 
-# Module-level singleton
-_session: RenderDocSession | None = None
+def _ensure_initialized():
+    """Initialize the RenderDoc replay system once globally."""
+    global _replay_initialized
+    if not _replay_initialized:
+        rd.InitialiseReplay(rd.GlobalEnvironment(), [])
+        _replay_initialized = True
 
 
-def get_session() -> RenderDocSession:
-    """Get or create the global RenderDocSession singleton."""
-    global _session
-    if _session is None:
-        _session = RenderDocSession()
-    return _session
+def get_session() -> RenderDocSession | None:
+    """Return the currently active RenderDocSession, or None if none is active."""
+    if _active_session_id is None:
+        return None
+    return _sessions.get(_active_session_id)
+
+
+def open_session(filepath: str, shader_debug_paths: list[str] | None = None) -> dict:
+    """Open a capture file as a new session and activate it.
+
+    If the filepath is already open, the existing session is activated and
+    its info returned (no re-open). Otherwise a new session is created.
+
+    Args:
+        filepath: Absolute path to the .rdc file.
+        shader_debug_paths: Optional shader PDB search directories.
+
+    Returns:
+        dict with capture info on success, or error dict on failure.
+    """
+    global _active_session_id
+
+    filepath = os.path.normpath(filepath)
+    _ensure_initialized()
+
+    # Idempotent: already open → just activate and return info
+    if filepath in _sessions:
+        _active_session_id = filepath
+        sess = _sessions[filepath]
+        return {
+            "filepath": filepath,
+            "api": sess.driver_name,
+            "total_actions": len(sess.action_map),
+            "textures": len(sess.controller.GetTextures()),
+            "buffers": len(sess.controller.GetBuffers()),
+            "status": "already_open_activated",
+        }
+
+    sess = RenderDocSession()
+    result = sess.open(filepath, shader_debug_paths=shader_debug_paths)
+
+    if "error" in result:
+        return result
+
+    _sessions[filepath] = sess
+    _active_session_id = filepath
+    result["active_captures"] = len(_sessions)
+    return result
+
+
+def switch_session(filepath: str) -> dict:
+    """Switch the active session to the given filepath.
+
+    Args:
+        filepath: Path of the already-opened capture to activate.
+
+    Returns:
+        dict with status info, or error dict if not found.
+    """
+    global _active_session_id
+
+    filepath = os.path.normpath(filepath)
+    if filepath not in _sessions:
+        keys = list(_sessions.keys())
+        return make_error(
+            f"Capture '{filepath}' is not open. Open captures: {keys}",
+            "SESSION_NOT_FOUND",
+        )
+    _active_session_id = filepath
+    sess = _sessions[filepath]
+    return {
+        "status": "switched",
+        "active_filepath": filepath,
+        "api": sess.driver_name,
+        "total_actions": len(sess.action_map),
+        "current_event": sess.current_event,
+    }
+
+
+def list_sessions() -> list[dict]:
+    """Return info about all open capture sessions."""
+    result = []
+    for fp, sess in _sessions.items():
+        result.append({
+            "filepath": fp,
+            "api": sess.driver_name,
+            "total_actions": len(sess.action_map),
+            "current_event": sess.current_event,
+            "is_active": fp == _active_session_id,
+        })
+    return result
+
+
+def close_session(filepath: str | None = None) -> dict:
+    """Close a specific capture session (or the active one if filepath is None).
+
+    After closing, the active session is switched to the most-recently-opened
+    remaining session, if any.
+
+    Args:
+        filepath: Path of the capture to close, or None to close the active one.
+
+    Returns:
+        dict with status info.
+    """
+    global _active_session_id
+
+    target = os.path.normpath(filepath) if filepath else _active_session_id
+    if target is None:
+        return {"status": "no capture was open"}
+    if target not in _sessions:
+        return make_error(f"Capture '{target}' is not open.", "SESSION_NOT_FOUND")
+
+    sess = _sessions.pop(target)
+    result = sess.close()
+
+    # Update active pointer
+    if _active_session_id == target:
+        _active_session_id = next(reversed(_sessions), None)
+
+    result["remaining_captures"] = len(_sessions)
+    result["active_filepath"] = _active_session_id
+    return result
+
+
+def close_all_sessions() -> dict:
+    """Close all open capture sessions.
+
+    Does NOT call ShutdownReplay — that is reserved for shutdown_all().
+    """
+    global _active_session_id
+
+    closed = []
+    errors = []
+    for fp, sess in list(_sessions.items()):
+        try:
+            sess.close()
+            closed.append(fp)
+        except Exception as exc:
+            errors.append({"filepath": fp, "error": str(exc)})
+    _sessions.clear()
+    _active_session_id = None
+
+    result: dict = {"status": "all_closed", "closed": closed}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def shutdown_all() -> None:
+    """Close all sessions and deinitialize the replay system. Call only at process exit."""
+    global _replay_initialized
+
+    close_all_sessions()
+    if _replay_initialized:
+        rd.ShutdownReplay()
+        _replay_initialized = False

@@ -1,14 +1,20 @@
-"""Session management tools: open_capture, close_capture, get_capture_info, get_frame_overview."""
+"""Session management tools: open_capture, close_capture, list_captures, switch_capture, get_capture_info, get_frame_overview."""
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from renderdoc_mcp.session import get_session
+from renderdoc_mcp.session import (
+    get_session,
+    open_session,
+    close_session,
+    switch_session,
+    list_sessions,
+)
 from renderdoc_mcp.util import rd, to_json, make_error, flags_to_list
+from renderdoc_mcp.runtime import IDLE_TIMEOUT_MINUTES
 
 
 def _get_gpu_quirks(driver_name: str) -> list[str]:
@@ -54,8 +60,15 @@ def register(mcp: FastMCP):
     ) -> str:
         """Open a RenderDoc capture (.rdc) file for analysis.
 
-        Automatically closes any previously opened capture.
-        Returns capture overview: API type, action count, resource counts.
+        Multiple captures can be open simultaneously. Each capture is tracked by
+        its filepath. Opening a new capture does NOT close previously opened ones —
+        use close_capture or list_captures to manage them.
+
+        The newly opened capture becomes the active session for all subsequent tool
+        calls. Use switch_capture to switch between open captures.
+
+        If the same filepath is opened again, the existing session is simply
+        re-activated (no duplicate open).
 
         Args:
             filepath: Absolute path to the .rdc capture file.
@@ -65,28 +78,63 @@ def register(mcp: FastMCP):
                 GUI's "Shader debug info search paths" setting.
                 Example: ["E:/Project/Saved/ShaderSymbols"]
         """
-        filepath = os.path.normpath(filepath)
-        session = get_session()
-        result = session.open(filepath, shader_debug_paths=shader_debug_paths)
+        result = open_session(filepath, shader_debug_paths=shader_debug_paths)
+        if IDLE_TIMEOUT_MINUTES > 0:
+            result.setdefault("idle_auto_close_minutes", IDLE_TIMEOUT_MINUTES)
         return to_json(result)
 
     @mcp.tool()
-    def close_capture() -> str:
-        """Close the currently open capture file and free resources."""
-        session = get_session()
-        return to_json(session.close())
+    def close_capture(filepath: Optional[str] = None) -> str:
+        """Close a capture file and free its resources.
+
+        If filepath is provided, closes that specific capture.
+        If omitted, closes the currently active capture.
+
+        After closing, the active session automatically switches to the most
+        recently opened remaining capture (if any).
+
+        Args:
+            filepath: Path of the capture to close. Defaults to the active capture.
+        """
+        return to_json(close_session(filepath))
+
+    @mcp.tool()
+    def list_captures() -> str:
+        """List all currently open capture files and their status.
+
+        Returns each capture's filepath, API type, total action count,
+        current event, and whether it is the active session.
+        """
+        sessions = list_sessions()
+        return to_json({
+            "captures": sessions,
+            "count": len(sessions),
+            "idle_auto_close_minutes": IDLE_TIMEOUT_MINUTES if IDLE_TIMEOUT_MINUTES > 0 else "disabled",
+        })
+
+    @mcp.tool()
+    def switch_capture(filepath: str) -> str:
+        """Switch the active capture session to the specified file.
+
+        All subsequent tool calls will operate on this capture until
+        switch_capture is called again or the capture is closed.
+
+        Args:
+            filepath: Absolute path of an already-opened capture to activate.
+                      Use list_captures to see available captures.
+        """
+        return to_json(switch_session(filepath))
 
     @mcp.tool()
     def get_capture_info() -> str:
-        """Get information about the currently open capture.
+        """Get information about the currently active capture.
 
         Returns API type, file path, action count, texture/buffer counts,
         and known GPU quirks based on the detected driver/GPU.
         """
         session = get_session()
-        err = session.require_open()
-        if err:
-            return to_json(err)
+        if session is None:
+            return to_json(make_error("No capture file is open. Use open_capture first.", "NO_CAPTURE_OPEN"))
 
         controller = session.controller
         textures = controller.GetTextures()
@@ -132,6 +180,9 @@ def register(mcp: FastMCP):
         main render targets with draw counts, and estimated resolution.
         """
         session = get_session()
+        if session is None:
+            return to_json(make_error("No capture file is open. Use open_capture first.", "NO_CAPTURE_OPEN"))
+
         err = session.require_open()
         if err:
             return to_json(err)
@@ -154,7 +205,6 @@ def register(mcp: FastMCP):
         textures = controller.GetTextures()
         tex_total_bytes = 0
         for tex in textures:
-            # Prefer precise byteSize from RenderDoc API if available
             size = 0
             try:
                 if hasattr(tex, "byteSize") and tex.byteSize > 0:
@@ -162,7 +212,6 @@ def register(mcp: FastMCP):
             except Exception:
                 pass
             if size == 0:
-                # Fallback: heuristic estimate
                 bpp = 4
                 fmt_name = str(tex.format.Name()).upper()
                 if "R16G16B16A16" in fmt_name:
@@ -180,13 +229,12 @@ def register(mcp: FastMCP):
                 elif "R8" in fmt_name and "G8" not in fmt_name:
                     bpp = 1
                 elif "BC" in fmt_name or "ETC" in fmt_name or "ASTC" in fmt_name:
-                    bpp = 1  # compressed: ~1 byte per pixel average
+                    bpp = 1
                 elif "D24" in fmt_name or "D32" in fmt_name:
                     bpp = 4
                 elif "D16" in fmt_name:
                     bpp = 2
                 size = tex.width * tex.height * max(tex.depth, 1) * max(tex.arraysize, 1) * bpp
-                # Account for mip chain (~1.33x)
                 if tex.mips > 1:
                     size = int(size * 1.33)
             tex_total_bytes += size
@@ -214,7 +262,6 @@ def register(mcp: FastMCP):
                 rt_entry["format"] = str(tex_desc.format.Name())
             render_targets.append(rt_entry)
 
-        # Infer resolution from the most-used render target
         resolution = "unknown"
         if render_targets:
             top_rt = render_targets[0]

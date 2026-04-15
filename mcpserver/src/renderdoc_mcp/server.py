@@ -7,7 +7,7 @@ import atexit
 from mcp.server.fastmcp import FastMCP
 
 from renderdoc_mcp.runtime import install_tool_runtime_guards
-from renderdoc_mcp.session import get_session
+from renderdoc_mcp.session import shutdown_all
 
 from renderdoc_mcp.tools import (
     session_tools,
@@ -119,7 +119,7 @@ def analyze_performance() -> str:
 # ── Cleanup ──
 
 def _cleanup():
-    get_session().shutdown()
+    shutdown_all()
 
 atexit.register(_cleanup)
 
