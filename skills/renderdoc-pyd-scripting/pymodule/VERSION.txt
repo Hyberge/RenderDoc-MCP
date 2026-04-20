@@ -1,0 +1,14 @@
+Python Version: 3.14.3
+Platform: x64 Windows
+Configuration: Release
+Build Time: 2026-04-20
+
+renderdoc.pyd requires the EXACT Python version above.
+If your Python version differs, rebuild using build_and_install.ps1.
+
+Files:
+  - renderdoc.pyd     (Python extension module)
+  - renderdoc.dll     (RenderDoc core library)
+  - d3dcompiler_47.dll (D3D shader compiler)
+  - dbghelp.dll       (Debug symbol helper)
+  - symsrv.dll        (Symbol server client)

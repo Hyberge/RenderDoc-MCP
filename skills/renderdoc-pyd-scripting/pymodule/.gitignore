@@ -1,0 +1,3 @@
+# Binary files - built by build_and_install.ps1, not tracked in git
+*.pyd
+*.dll
