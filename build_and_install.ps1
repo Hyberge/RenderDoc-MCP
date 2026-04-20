@@ -8,9 +8,10 @@
     2. Patch python.props to work with standard Python installations
     3. Optionally run MSBuild solution Clean and remove residual intermediates
     4. Build renderdoc.pyd using MSBuild
-    5. Collect build outputs (renderdoc.pyd, renderdoc.dll)
-    6. Install MCP Server via pip
-    7. Generate MCP configuration file
+    5. Collect build outputs (renderdoc.pyd, renderdoc.dll) to skills/renderdoc-pyd-scripting/pymodule/
+    6. Auto-generate VERSION.txt with Python version and build metadata
+    7. Install MCP Server via pip
+    8. Generate MCP configuration file
 
 .PREREQUISITES
     - Python >= 3.6 (full installation with include headers and libs)
@@ -281,8 +282,8 @@ function Stop-McpServerIfBlocking {
             }
             "2" {
                 Write-Host ""
-                Write-Host "  Skipping file copy. The build outputs remain in:" -ForegroundColor Yellow
-                Write-Host "    $BuildProductDir" -ForegroundColor Yellow
+                Write-Host "  Skipping file copy. The existing files remain in:" -ForegroundColor Yellow
+                Write-Host "    $DestinationDir" -ForegroundColor Yellow
                 Write-Host "  You can manually copy them after stopping the MCP server." -ForegroundColor Yellow
                 return $false
             }
@@ -678,8 +679,8 @@ if (-not (Test-Path $PyModuleVcxproj)) {
     Write-Error-Exit "pyrenderdoc_module.vcxproj not found: $PyModuleVcxproj"
 }
 
-$BuildOutputDir = Join-Path $ScriptDir "build\$Platform"
-$BuildLogFile = Join-Path $BuildOutputDir "build.log"
+$BuildOutputDir = Join-Path $ScriptDir "skills\renderdoc-pyd-scripting\pymodule"
+$BuildLogFile = Join-Path $ScriptDir "build.log"
 $BuildProductDir = Join-Path $ScriptDir "renderdoc\$Platform\$Configuration"
 $PyModulesDir = Join-Path $BuildProductDir "pymodules"
 
@@ -777,7 +778,7 @@ $AllFilesToCopy += $PydFiles
 $AllFilesToCopy += $UniqueDlls
 $ShouldCopy = Stop-McpServerIfBlocking -FilesToCopy $AllFilesToCopy -DestinationDir $BuildOutputDir
 
-# Copy all to output dir
+# Copy all to output dir (skills/renderdoc-pyd-scripting/pymodule/)
 if ($ShouldCopy) {
     foreach ($f in $PydFiles) {
         Copy-Item $f.FullName -Destination $BuildOutputDir -Force
@@ -787,7 +788,36 @@ if ($ShouldCopy) {
         Copy-Item $f.FullName -Destination $BuildOutputDir -Force
         Write-Success "Copied $($f.Name) to: $BuildOutputDir"
     }
+
+    # Generate VERSION.txt with build metadata
+    $VersionFile = Join-Path $BuildOutputDir "VERSION.txt"
+    $FullPythonVersion = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>$null
+    $BuildTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
+    $FileList = @()
+    $FileList += $PydFiles | ForEach-Object { "  - $($_.Name)     (Python extension module)" }
+    $FileList += $UniqueDlls | ForEach-Object { "  - $($_.Name)" }
+    $VersionContent = @"
+Python Version: $FullPythonVersion
+Platform: $Platform Windows
+Configuration: $Configuration
+Build Time: $BuildTimestamp
+
+renderdoc.pyd requires the EXACT Python version above.
+If your Python version differs, rebuild using build_and_install.ps1.
+
+Files:
+$($FileList -join "`n")
+"@
+    [System.IO.File]::WriteAllText($VersionFile, $VersionContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Success "VERSION.txt updated: Python $FullPythonVersion, built at $BuildTimestamp"
 }
+
+
+
+
+
+
+
 
 
 
@@ -849,7 +879,7 @@ Write-Success "MCP Server installed successfully"
 Write-Step "Generating MCP configuration..."
 
 $McpConfigPath = Join-Path $ScriptDir "mcp.json"
-$McpModuleDir = $BuildOutputDir
+$McpModuleDir = $BuildOutputDir  # skills/renderdoc-pyd-scripting/pymodule/
 
 # Build JSON manually to ensure correct indentation (tabs) and key order
 $EscapedPython = $PythonExe.Replace('\', '\\')
@@ -886,6 +916,8 @@ Write-Host "`nBuild outputs in $BuildOutputDir :" -ForegroundColor Yellow
 Get-ChildItem -Path $BuildOutputDir -Include '*.pyd','*.dll' -File -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 1)) MB)"
 }
+Write-Host "  VERSION.txt (build metadata)"
+Write-Host "  Build log: $BuildLogFile"
 Write-Host "  MCP config: $McpConfigPath"
 
 Write-Host "`nConfiguration for Claude Desktop / Cursor / VS Code:" -ForegroundColor Yellow
