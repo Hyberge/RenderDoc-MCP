@@ -581,10 +581,11 @@ Write-Success "Python $PythonVersion found at: $PythonPrefix"
 Write-Host "  Python executable: $PythonExe"
 Write-Host "  PythonMajorMinor: $PythonMajorMinor"
 
-if ($PythonMajor -lt 3 -or ($PythonMajor -eq 3 -and $PythonMinor -lt 6)) {
+# The MCP server (mcpserver/pyproject.toml) and the mcp SDK require Python >= 3.10.
+if ($PythonMajor -lt 3 -or ($PythonMajor -eq 3 -and $PythonMinor -lt 10)) {
     Write-Error-Exit `
-        "Python version $PythonVersion is too old. Required: >= 3.6" `
-        "Please upgrade Python from https://www.python.org"
+        "Python version $PythonVersion is too old. Required: >= 3.10 (mcpserver requires-python = '>=3.10')." `
+        "Install Python 3.10+ from https://www.python.org, check 'Add Python to PATH', then re-run this script.`nCurrent interpreter: $PythonExe"
 }
 
 $PythonInclude = Join-Path $PythonPrefix "include\Python.h"
@@ -945,9 +946,25 @@ $PipResult = & $PythonExe -m pip install -e $McpServerPath 2>&1
 $PipExitCode = $LASTEXITCODE
 $ErrorActionPreference = $SavedEAP
 
+$PipOutput = ($PipResult | ForEach-Object { "$_" }) -join "`n"
+
 if ($PipExitCode -ne 0) {
-    Write-Host ($PipResult | Out-String)
-    Write-Error-Exit "Failed to install MCP Server"
+    if ($PipOutput) { Write-Host $PipOutput }
+    $PipVersionText = "unknown"
+    if ($PipOutput -match "editable mode currently requires a setuptools-based build") {
+        $PipVersionText = (Invoke-NativeQuiet -Exe $PythonExe -Arguments @("-m", "pip", "--version")).Lines[0]
+        Write-Error-Exit `
+            "Failed to install MCP Server: pip is too old for editable installs of a pyproject-only project." `
+            "Detected: $PipVersionText`nPEP 660 editable installs require pip >= 21.3. Upgrade it and re-run:`n  `"$PythonExe`" -m pip install --upgrade pip"
+    }
+    if ($PipOutput -match "requires-python|No matching distribution found") {
+        Write-Error-Exit `
+            "Failed to install MCP Server: dependencies are incompatible with Python $PythonVersion." `
+            "mcpserver requires Python >= 3.10. Install Python 3.10+ and re-run this script.`nInterpreter used: $PythonExe"
+    }
+    Write-Error-Exit `
+        "Failed to install MCP Server" `
+        "Command: `"$PythonExe`" -m pip install -e `"$McpServerPath`""
 }
 
 Write-Success "MCP Server installed successfully"
