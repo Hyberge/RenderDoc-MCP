@@ -90,6 +90,50 @@ function Test-Command {
     return $?
 }
 
+# Runs a native command without letting its stderr abort the script.
+# With $ErrorActionPreference = "Stop", any stderr line from a native process
+# becomes a terminating NativeCommandError -- which is exactly what the py
+# launcher triggers, since it prints its list output to stderr.
+function Invoke-NativeQuiet {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [switch]$MergeStdErr
+    )
+
+    $SavedEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+
+    $Lines = @()
+    if ($MergeStdErr) {
+        $Lines = @(& $Exe @Arguments 2>&1 | ForEach-Object { "$_" })
+    }
+    else {
+        $Lines = @(& $Exe @Arguments 2>$null)
+    }
+    $ExitCode = $LASTEXITCODE
+
+    $ErrorActionPreference = $SavedEAP
+
+    return [pscustomobject]@{ ExitCode = $ExitCode; Lines = $Lines }
+}
+
+# A PATH hit alone does not prove a Python executable works: Windows ships
+# "App Execution Alias" stubs (%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe)
+# that are 0-byte reparse points and exit with 9009 instead of running Python.
+function Test-PythonExecutable {
+    param([string]$Exe)
+
+    if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { return $false }
+
+    $Item = Get-Item -LiteralPath $Exe -ErrorAction SilentlyContinue
+    if ($Item -and $Item.Length -eq 0) { return $false }
+
+    $Probe = Invoke-NativeQuiet -Exe $Exe -Arguments @("-c", "import sys") -MergeStdErr
+
+    return ($Probe.ExitCode -eq 0)
+}
+
 function Test-RenderDocSourceReady {
     param([string]$RootDir)
 
@@ -468,30 +512,66 @@ $PythonPrefix = $null
 $PythonVersion = $null
 $PythonMajorMinor = $null
 
-if (Test-Command "python") {
-    $PythonExe = (Get-Command python).Source
+foreach ($Command in @("python", "python3")) {
+    if ($PythonExe) { break }
+    if (-not (Test-Command $Command)) { continue }
+    $Candidate = (Get-Command $Command).Source
+    if (Test-PythonExecutable $Candidate) {
+        $PythonExe = $Candidate
+    }
+    else {
+        Write-Host "  Ignoring non-functional Python at: $Candidate (Windows Store alias stub?)" -ForegroundColor Yellow
+    }
 }
-elseif (Test-Command "py") {
-    $pyResult = py --list 2>$null
-    if ($LASTEXITCODE -eq 0 -and $pyResult) {
-        $pyLine = $pyResult | Where-Object { $_ -match "-V3\." } | Select-Object -First 1
-        if ($pyLine -match "^\s*(-V[\d.]+)\s+") {
-            $pyVersion = $Matches[1]
-            $PythonExe = py $pyVersion -c "import sys; print(sys.executable)" 2>$null
+
+if (-not $PythonExe -and (Test-Command "py")) {
+    # py --list output differs across launcher versions, and it is written to
+    # stderr, so stderr must be merged in to read it at all:
+    #   -V:3.11 *     (launcher >= 3.6)
+    #   -3.9-64       (older launcher)
+    $pyList = Invoke-NativeQuiet -Exe "py" -Arguments @("--list") -MergeStdErr
+
+    $pyVersionTag = $null
+    if ($pyList.ExitCode -eq 0 -and $pyList.Lines.Count -gt 0) {
+        $pyLine = $pyList.Lines | Where-Object { $_ -match "^\s*(-V:\d+\.\d+|-\d+\.\d+)" } | Select-Object -First 1
+        if ($pyLine -and $pyLine -match "^\s*-V:(\d+\.\d+)") {
+            $pyVersionTag = "-V:$($Matches[1])"
         }
+        elseif ($pyLine -and $pyLine -match "^\s*-(\d+\.\d+)") {
+            $pyVersionTag = "-$($Matches[1])"
+        }
+    }
+
+    $Candidate = $null
+    if ($pyVersionTag) {
+        $pyExeResult = Invoke-NativeQuiet -Exe "py" -Arguments @($pyVersionTag, "-c", "import sys; print(sys.executable)")
+        if ($pyExeResult.ExitCode -eq 0 -and $pyExeResult.Lines.Count -gt 0) {
+            $Candidate = $pyExeResult.Lines[0].Trim()
+        }
+    }
+    if (-not $Candidate) {
+        $pyExeResult = Invoke-NativeQuiet -Exe "py" -Arguments @("-c", "import sys; print(sys.executable)")
+        if ($pyExeResult.ExitCode -eq 0 -and $pyExeResult.Lines.Count -gt 0) {
+            $Candidate = $pyExeResult.Lines[0].Trim()
+        }
+    }
+    if (Test-PythonExecutable $Candidate) {
+        $PythonExe = $Candidate
     }
 }
 
 if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
     Write-Error-Exit `
-        "Python not found in PATH." `
-        "Please install Python >= 3.6 from https://www.python.org`nMake sure to check 'Add Python to PATH' during installation."
+        "No working Python interpreter found." `
+        "Install Python >= 3.6 from https://www.python.org and check 'Add Python to PATH' during installation.`nIf a real installation exists, disable the 'python.exe' / 'python3.exe' App Execution Alias under Settings > Apps > Advanced app settings > App execution aliases."
 }
 
-$PythonInfo = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{sys.prefix}|{sys.version_info.major}{sys.version_info.minor}')" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$PythonInfoResult = Invoke-NativeQuiet -Exe $PythonExe -Arguments @("-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{sys.prefix}|{sys.version_info.major}{sys.version_info.minor}')")
+if ($PythonInfoResult.ExitCode -ne 0 -or $PythonInfoResult.Lines.Count -eq 0) {
     Write-Error-Exit "Failed to get Python version information."
 }
+
+$PythonInfo = $PythonInfoResult.Lines[0]
 
 $PythonVersion, $PythonPrefix, $PythonMajorMinor = $PythonInfo.Split('|')
 $PythonMajor = [int]($PythonVersion.Split('.')[0])
@@ -791,7 +871,7 @@ if ($ShouldCopy) {
 
     # Generate VERSION.txt with build metadata
     $VersionFile = Join-Path $BuildOutputDir "VERSION.txt"
-    $FullPythonVersion = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>$null
+    $FullPythonVersion = (Invoke-NativeQuiet -Exe $PythonExe -Arguments @("-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")).Lines[0]
     $BuildTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
     $FileList = @()
     $FileList += $PydFiles | ForEach-Object { "  - $($_.Name)     (Python extension module)" }
