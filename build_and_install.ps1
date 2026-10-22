@@ -784,6 +784,9 @@ if ($Clean) {
 }
 
 $env:RENDERDOC_PYTHON_PREFIX64 = $PythonPrefix
+# python.props reads $(VSPythonOverridePath); MSBuild maps environment variables to
+# properties by name, so without this the module links the bundled python36.lib.
+$env:VSPythonOverridePath = $PythonPrefix
 
 # When building pyrenderdoc_module.vcxproj directly, MSBuild loses the solution-only
 # dependencies from renderdoc.sln (breakpad_common/crash_generation_*/exception_handler).

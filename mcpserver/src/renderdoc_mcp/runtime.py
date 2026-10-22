@@ -26,6 +26,8 @@ IDLE_TIMEOUT_MINUTES = max(0, int(os.environ.get("RENDERDOC_MCP_IDLE_TIMEOUT_MIN
 # Per-tool timeout overrides (tool_name -> timeout_ms)
 _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "open_capture": 60000,  # 60s — large captures with shader debug path scanning take longer
+    # The tool enforces its own timeout_seconds and kills the process tree itself.
+    "run_qrenderdoc_script": 3660000,
 }
 
 

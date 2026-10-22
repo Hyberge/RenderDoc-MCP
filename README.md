@@ -327,6 +327,14 @@ diagnose_mobile_risks()                  # 移动端 GPU 全面风险检查
 | `get_resource_details` | 资源完整信息：父/派生资源关系、精确字节大小、使用摘要 |
 | `get_cached_message` | 查询超长结果缓存：基于 `message_id` 分页、切换视图或全文搜索 |
 
+### qrenderdoc 脚本（1 个）
+
+| 工具 | 说明 |
+|------|------|
+| `run_qrenderdoc_script` | 在 `qrenderdoc.exe` 内嵌解释器里跑脚本（需要 `pyrenderdoc`/`PySide2` 时用）。包装器负责退出：排队到 Qt 事件循环关窗 + `quit()`，5s 后 `os._exit` 兜底；超过 `timeout_seconds` 直接 `taskkill /T`。脚本 print 内容回传到 `log_tail` |
+
+> `qrenderdoc.exe --python` 在启动阶段执行脚本，此时事件循环还没跑，脚本里直接 `app.quit()` 是空操作，GUI 会一直挂着——这正是该工具要绕开的坑。纯 capture 分析请优先用常驻 headless 工具，不必起 GUI。
+
 
 ## 提示模板
 

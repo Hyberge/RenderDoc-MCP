@@ -8,7 +8,8 @@ version = "0.2.0"
 description = "MCP server for RenderDoc graphics debugger - enables AI-assisted frame capture analysis"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    # FastMCP lives in mcp<2; mcp 2.x renamed it to MCPServer and changed the API.
+    "mcp[cli]>=1.0.0,<2",
 ]
 
 [project.scripts]

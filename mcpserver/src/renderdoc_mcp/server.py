@@ -20,6 +20,7 @@ from renderdoc_mcp.tools import (
     performance_tools,
     diagnostic_tools,
     inspection_tools,
+    qrenderdoc_tools,
 )
 
 mcp = FastMCP(
@@ -41,6 +42,7 @@ advanced_tools.register(mcp)
 performance_tools.register(mcp)
 diagnostic_tools.register(mcp)
 inspection_tools.register(mcp)
+qrenderdoc_tools.register(mcp)
 
 
 # ── Prompts ──
